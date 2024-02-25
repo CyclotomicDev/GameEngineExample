@@ -1,9 +1,11 @@
 //use winit::event_loop::{ControlFlow, EventLoop};
 use control::control::{Buffer, Instruction, InstructionErr};
-use std::{collections::VecDeque, fmt::Error};
+use std::{collections::VecDeque, fmt::Error, future::Future, process::Output, time::Duration};
+use tokio::{task::JoinHandle, time::sleep};
 
 
-fn main() -> Result<(), Error> {
+#[tokio::main]
+async fn main() -> Result<(), Error> {
     let mut app = App::new();
 
     loop {
@@ -21,14 +23,14 @@ fn main() -> Result<(), Error> {
                 app.state_buffer.push_back(StateChange::new(Box::new(|x| {*x = GameState::Menu; Ok(())})));
             },
             GameState::Menu => { // Main menu - controls all main paths
-                app.event_loop.run(move |event,_,control_flow| {
-                    *control_flow = ControlFlow::Poll;
-                    match event {
-                        
-                    }
-                })
-                    
                 
+                let mut graphics_loop : Option<JoinHandle<()>> = None;
+                let mut data_loop : Option<JoinHandle<()>> = None;
+                
+                loop {
+                    retrieve_graphics_cycle(&mut graphics_loop);
+                    retrieve_data_cycle(&mut data_loop);
+                }
             },
             GameState::Exit => {
                 println!("At state exit");
@@ -94,6 +96,12 @@ struct App {
 }
 
 struct  Graphics;
+
+
+impl Graphics {
+    
+}
+
 struct  Data;
 struct Network;
 
@@ -104,11 +112,49 @@ impl App {
         let network = None;
         let state = GameState::new();
         let state_buffer = Buffer::<StateChange>::new();
-        let event_loop = EventLoop::new();
-        Self {graphics,data,network,state,state_buffer,event_loop}
+        //let event_loop = EventLoop::new();
+        Self {graphics,data,network,state,state_buffer}
     }
 }
 
 struct Settings {
 
+
+}
+
+fn retrieve_graphics_cycle(cycle: &mut Option<JoinHandle<()>>) {
+
+    if let Some(link) = cycle {
+        if !link.is_finished() {
+            // No new cycle created
+            return;
+        }
+    }
+
+    // New cycle must be created
+    let graphics_fn = async {
+        sleep(Duration::from_millis(1000)).await;
+                    println!("1 sec");
+    };
+
+    *cycle = Some(tokio::spawn(graphics_fn));
+}
+
+
+fn retrieve_data_cycle(cycle: &mut Option<JoinHandle<()>>) {
+
+    if let Some(link) = cycle {
+        if !link.is_finished() {
+            // No new cycle created
+            return;
+        }
+    }
+
+    // New cycle must be created
+    let data_fn = async {
+        sleep(Duration::from_millis(500)).await;
+                    println!("0.5 sec");
+    };
+
+    *cycle = Some(tokio::spawn(data_fn));
 }
