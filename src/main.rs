@@ -1,14 +1,22 @@
 //use winit::event_loop::{ControlFlow, EventLoop};
 use control::control::{Buffer, Instruction, InstructionErr};
+use winit::platform::pump_events::{PumpStatus, EventLoopExtPumpEvents};
 use std::{collections::VecDeque, fmt::Error, future::Future, process::Output, time::Duration};
 use tokio::{task::JoinHandle, time::sleep};
-
+use winit::dpi::LogicalSize;
+use winit::event_loop::{self, ControlFlow, EventLoop};
+use winit::event::{Event, WindowEvent};
+use winit::window::{Window, WindowBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let mut app = App::new();
 
-    loop {
+    let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800));
+
+    
+
+    'main: loop {
         // Goes through state buffer to get current state
         app.state.process_state(&mut app.state_buffer);
 
@@ -28,6 +36,25 @@ async fn main() -> Result<(), Error> {
                 let mut data_loop : Option<JoinHandle<()>> = None;
                 
                 loop {
+                    let timeout = Some(Duration::ZERO);
+                    let status = window_handler.event_loop.pump_events(timeout, |event, elwt| {
+                        match event {
+                            Event::WindowEvent { 
+                                event: WindowEvent::CloseRequested, 
+                                window_id,
+                            } if window_id == window_handler.window.id() => elwt.exit(),
+                            Event::AboutToWait => {
+                                window_handler.window.request_redraw();
+                            },
+                            _ => (),
+                        }
+                    });
+
+                    if let PumpStatus::Exit(exit_code) = status {
+                        println!("Close window; Exit code {}",exit_code);
+                        break 'main;
+                    }
+
                     retrieve_graphics_cycle(&mut graphics_loop);
                     retrieve_data_cycle(&mut data_loop);
                 }
@@ -36,6 +63,15 @@ async fn main() -> Result<(), Error> {
                 println!("At state exit");
                 break;
             },
+            GameState::Game => { //Holds data for normal running of the game
+                let mut graphics_loop : Option<JoinHandle<()>> = None;
+                let mut data_loop : Option<JoinHandle<()>> = None;
+                
+                loop {
+                    retrieve_graphics_cycle(&mut graphics_loop);
+                    retrieve_data_cycle(&mut data_loop);
+                }
+            }
         };
     }
 
@@ -47,6 +83,7 @@ enum GameState {
     Start,
     Init,
     Menu,
+    Game,
     Exit,
 }
 
@@ -157,4 +194,24 @@ fn retrieve_data_cycle(cycle: &mut Option<JoinHandle<()>>) {
     };
 
     *cycle = Some(tokio::spawn(data_fn));
+}
+
+
+/// Contains all information about window control
+struct WindowHandler {
+    event_loop: EventLoop<()>,
+    window: Window,
+}
+
+/// To do: hnadle errors
+impl WindowHandler {
+    fn new(title: &str, (width, height): (u32,u32)) -> Self{
+        let event_loop = EventLoop::new().unwrap();
+        let window = WindowBuilder::new()
+            .with_title(title)
+            .with_inner_size(LogicalSize::new(width,height))
+            .build(&event_loop).unwrap();
+
+        Self {event_loop, window}
+    }
 }
