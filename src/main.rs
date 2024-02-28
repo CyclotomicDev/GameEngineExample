@@ -7,14 +7,17 @@ use winit::dpi::LogicalSize;
 use winit::event_loop::{self, ControlFlow, EventLoop};
 use winit::event::{Event, WindowEvent};
 use winit::window::{Window, WindowBuilder};
-
+use anyhow::{Result,Context,anyhow};
+use log::{LevelFilter, info, trace};
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<()> {
+    
+    simple_logging::log_to_file("test.log", LevelFilter::Info)?;
+
+
     let mut app = App::new();
 
-    let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800));
-
-    
+    let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
 
     'main: loop {
         // Goes through state buffer to get current state
@@ -23,7 +26,7 @@ async fn main() -> Result<(), Error> {
         // Chooses action based on current game state
         match app.state {
             GameState::Start => {
-                println!("At state start");
+                trace!("At state start");
                 app.state_buffer.push_back(StateChange::new(Box::new(|x| {*x = GameState::Init; Ok(())})));
             },
             GameState::Init => { // Initializes graphics
@@ -51,7 +54,7 @@ async fn main() -> Result<(), Error> {
                     });
 
                     if let PumpStatus::Exit(exit_code) = status {
-                        println!("Close window; Exit code {}",exit_code);
+                        info!("Close window; Exit code {}",exit_code);
                         break 'main;
                     }
 
@@ -60,7 +63,7 @@ async fn main() -> Result<(), Error> {
                 }
             },
             GameState::Exit => {
-                println!("At state exit");
+                trace!("At state exit");
                 break;
             },
             GameState::Game => { //Holds data for normal running of the game
@@ -205,13 +208,16 @@ struct WindowHandler {
 
 /// To do: hnadle errors
 impl WindowHandler {
-    fn new(title: &str, (width, height): (u32,u32)) -> Self{
-        let event_loop = EventLoop::new().unwrap();
+    fn new(title: &str, (width, height): (u32,u32)) -> Result<Self>{
+        let event_loop = EventLoop::new()?;
         let window = WindowBuilder::new()
             .with_title(title)
             .with_inner_size(LogicalSize::new(width,height))
-            .build(&event_loop).unwrap();
+            .build(&event_loop)?;
+    
 
-        Self {event_loop, window}
+        info!("Window successfully created");
+
+        Ok(Self {event_loop, window})
     }
 }
