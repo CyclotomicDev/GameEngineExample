@@ -2,8 +2,6 @@
 
 
 pub mod control {
-    use std::ops::Deref;
-    use std::{collections::HashMap};
 
     pub enum InstructionErr {
         Invalid,

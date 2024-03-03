@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 lib = {path = "lib"}
 control = {path = "lib/control"}
+graphics = {path = "lib/graphics"}
 winit = "0.29.11"
 tokio = { version = "1.36.0", features = ["full"]}
 anyhow = "1.0.80"

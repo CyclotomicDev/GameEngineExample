@@ -1,14 +1,16 @@
 //use winit::event_loop::{ControlFlow, EventLoop};
 use control::control::{Buffer, Instruction, InstructionErr};
+use graphics::GraphicsHandler;
 use winit::platform::pump_events::{PumpStatus, EventLoopExtPumpEvents};
-use std::{collections::VecDeque, fmt::Error, future::Future, process::Output, time::Duration};
+use std::time::Duration;
 use tokio::{task::JoinHandle, time::sleep};
 use winit::dpi::LogicalSize;
-use winit::event_loop::{self, ControlFlow, EventLoop};
+use winit::event_loop::EventLoop;
 use winit::event::{Event, WindowEvent};
 use winit::window::{Window, WindowBuilder};
-use anyhow::{Result,Context,anyhow};
-use log::{LevelFilter, info, trace};
+use anyhow::Result;
+use log::*;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     
@@ -30,7 +32,8 @@ async fn main() -> Result<()> {
                 app.state_buffer.push_back(StateChange::new(Box::new(|x| {*x = GameState::Init; Ok(())})));
             },
             GameState::Init => { // Initializes graphics
-
+                app.graphics = Some(GraphicsHandler::new(&window_handler.window)?);
+                info!("Successful loading of Vulkan");
                 app.state_buffer.push_back(StateChange::new(Box::new(|x| {*x = GameState::Menu; Ok(())})));
             },
             GameState::Menu => { // Main menu - controls all main paths
@@ -58,7 +61,7 @@ async fn main() -> Result<()> {
                         break 'main;
                     }
 
-                    retrieve_graphics_cycle(&mut graphics_loop);
+                    retrieve_graphics_cycle(&mut graphics_loop, app.graphics.as_mut().unwrap() , &window_handler.window);
                     retrieve_data_cycle(&mut data_loop);
                 }
             },
@@ -71,7 +74,7 @@ async fn main() -> Result<()> {
                 let mut data_loop : Option<JoinHandle<()>> = None;
                 
                 loop {
-                    retrieve_graphics_cycle(&mut graphics_loop);
+                    //retrieve_graphics_cycle(&mut graphics_loop);
                     retrieve_data_cycle(&mut data_loop);
                 }
             }
@@ -128,7 +131,7 @@ impl Instruction for StateChange {
 }
 
 struct App {
-    graphics: Option<Graphics>,
+    graphics: Option<GraphicsHandler>,
     data: Option<Data>,
     network: Option<Network>,
     state: GameState,
@@ -162,7 +165,7 @@ struct Settings {
 
 }
 
-fn retrieve_graphics_cycle(cycle: &mut Option<JoinHandle<()>>) {
+fn retrieve_graphics_cycle(cycle: &mut Option<JoinHandle<()>>, graphics_handler: &mut GraphicsHandler, window: &Window) {
 
     if let Some(link) = cycle {
         if !link.is_finished() {
@@ -172,9 +175,9 @@ fn retrieve_graphics_cycle(cycle: &mut Option<JoinHandle<()>>) {
     }
 
     // New cycle must be created
-    let graphics_fn = async {
-        sleep(Duration::from_millis(1000)).await;
-                    println!("1 sec");
+    let graphics_fn = async move {
+        graphics_handler.render(window).unwrap();
+        ()
     };
 
     *cycle = Some(tokio::spawn(graphics_fn));
