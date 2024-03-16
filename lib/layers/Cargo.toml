@@ -1,12 +1,8 @@
 [package]
-name = "control"
+name = "layers"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.80"
-graphics = {path = "../graphics"}
-layers = {path = "../layers"}
-state = {path = "../state"}

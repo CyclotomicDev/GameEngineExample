@@ -1,16 +1,28 @@
 //use winit::event_loop::{ControlFlow, EventLoop};
-use control::control::{Buffer, Instruction, InstructionErr};
+use control::control::*;
 use graphics::GraphicsHandler;
+use layers::{AnyLayer, Layer};
+use state::StateHandler;
+use tokio::sync::mpsc::error::SendError;
 use winit::platform::pump_events::{PumpStatus, EventLoopExtPumpEvents};
+use std::error::Error;
+use std::future::Future;
+use std::ops::Deref;
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{task::JoinHandle, time::sleep, sync::mpsc, join};
+use tokio::sync::{Mutex, RwLock};
+use std::sync::Arc;
 use winit::dpi::LogicalSize;
-use winit::event_loop::EventLoop;
+use winit::event_loop::{self, EventLoop};
 use winit::event::{Event, WindowEvent};
-use winit::window::{Window, WindowBuilder};
+use winit::window::{self, Window, WindowBuilder};
 use anyhow::Result;
 use log::*;
+use std::any::Any;
 
+//#[tokio::main(flavor = "current_thread")]
 #[tokio::main]
 async fn main() -> Result<()> {
     
@@ -21,61 +33,162 @@ async fn main() -> Result<()> {
 
     let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
 
+    let mut graphics: Arc<Mutex<Option<Box<GraphicsHandler>>>> = Arc::new(Mutex::new(None));
+    let mut data: Option<Data> = None;
+
+    //let mut current_state: Box<GameState> = Box::new(GameState::new());
+    let mut current_state: StateHandler = StateHandler::new();
+    let (state_tx, mut state_rx) = mpsc::channel::<InstructionBuffer>(1);
+    {state_tx.send(InstructionBuffer::default()).await};
+
+    
+
     'main: loop {
         // Goes through state buffer to get current state
-        app.state.process_state(&mut app.state_buffer);
-
+        
+        //current_state.execute_all(state_rx.recv().await.unwrap());
+        state_rx.recv().await.unwrap().execute_all(current_state.as_any_mut())?;
         // Chooses action based on current game state
-        match app.state {
-            GameState::Start => {
-                trace!("At state start");
-                app.state_buffer.push_back(StateChange::new(Box::new(|x| {*x = GameState::Init; Ok(())})));
+        match current_state {
+            StateHandler::Start => {
+                info!("At state start");
+                
+                // Instruction to change state, returning no additional instructions
+                let state_instructions = InstructionBuffer::new(vec![
+                    Instruction::new(
+                        LayerType::State,
+                        Box::new(|operand: &mut StateHandler| {
+                            *operand = StateHandler::Init;
+                            InstructionBuffer::default()
+                    }))?,
+                ]);
+                state_tx.send(state_instructions).await;
             },
-            GameState::Init => { // Initializes graphics
-                app.graphics = Some(GraphicsHandler::new(&window_handler.window)?);
+            StateHandler::Init => { // Initializes graphics
+                let window = window_handler.window.as_ref();
+                let mut graphics = graphics.lock().await;
+                *graphics = Some(Box::new(GraphicsHandler::new(&window)?));
                 info!("Successful loading of Vulkan");
-                app.state_buffer.push_back(StateChange::new(Box::new(|x| {*x = GameState::Menu; Ok(())})));
+                
+                let state_instructions = InstructionBuffer::new(vec![
+                    Instruction::new(
+                        LayerType::State,
+                        Box::new(|operand: &mut StateHandler| {
+                            *operand = StateHandler::Menu;
+                            InstructionBuffer::default()
+                    }))?,
+                ]);
+                state_tx.send(state_instructions).await;
             },
-            GameState::Menu => { // Main menu - controls all main paths
-                
-                let mut graphics_loop : Option<JoinHandle<()>> = None;
-                let mut data_loop : Option<JoinHandle<()>> = None;
-                
-                loop {
-                    let timeout = Some(Duration::ZERO);
-                    let status = window_handler.event_loop.pump_events(timeout, |event, elwt| {
-                        match event {
-                            Event::WindowEvent { 
-                                event: WindowEvent::CloseRequested, 
-                                window_id,
-                            } if window_id == window_handler.window.id() => elwt.exit(),
-                            Event::AboutToWait => {
-                                window_handler.window.request_redraw();
-                            },
-                            _ => (),
+            StateHandler::Menu => { // Main menu - controls all main paths
+
+                {
+                    let mut graphics = graphics.clone();
+
+                    let window = window_handler.window.clone();
+
+                    let grph_window = window.clone();
+                    let ctrl_window = window.clone();
+
+                    // Channel from All to Control
+                    let (ctrl_tx, ctrl_rx) = mpsc::channel::<InstructionBuffer>(10);
+
+                    // Channel from Control to Grahpics
+                    let (grph_tx, mut grph_rx) = mpsc::channel::<InstructionBuffer>(1);
+                    
+                    //let mut graphics = graphics.as_mut().unwrap();
+                    let graphics_loop = async move {
+                        println!("Graphics loop start");
+                        let mut graphics = graphics.lock().await;
+                        let graphics = graphics.as_mut().unwrap();
+                        loop {
+                            // Control
+                            let mut crtl_instructions = grph_rx.recv().await.unwrap();
+
+                            
+                            
+                            // Execute instructions
+                            
+                            crtl_instructions.execute_all(graphics.as_any_mut());
+                            
+                            
+
+                            // Execute graphics
+                            graphics.render(&grph_window);
                         }
-                    });
 
-                    if let PumpStatus::Exit(exit_code) = status {
-                        info!("Close window; Exit code {}",exit_code);
-                        break 'main;
+                        ()
+                    };
+
+                    let (data_in, mut data_out) = mpsc::channel::<InstructionBuffer>(1);
+                    let data_loop = async {
+                        println!("Data loop start");
+                        loop {
+                            // Control
+
+                            // Execute data
+                            println!("1s");
+                            sleep(Duration::from_secs(1)).await;
+                        }
+
+                        ()
+                    };
+
+                    // Schedules all instructions and timing
+                    let control_loop = async move {
+                        
+                        todo!();
+                    };
+
+                    let graphics_loop = tokio::spawn(graphics_loop);
+                    let data_loop = tokio::spawn(data_loop);
+                    //let control_loop = tokio::spawn(control_loop);
+
+                    // Handle window events
+                    loop {
+                        let timeout = Some(Duration::ZERO);
+                        let status = window_handler.event_loop.pump_events(timeout, |event, elwt| {
+                            match event {
+                                Event::WindowEvent { 
+                                    event: WindowEvent::CloseRequested, 
+                                    window_id,
+                                } if window_id == window.id() => elwt.exit(),
+                                Event::AboutToWait => {
+                                    window_handler.window.request_redraw();
+                                },
+                                _ => (),
+                            }
+                        });
+
+                        if let PumpStatus::Exit(exit_code) = status {
+                            info!("Close window; Exit code {}",exit_code);
+                            let state_instructions = InstructionBuffer::new(vec![
+                                Instruction::new(
+                                    LayerType::State,
+                                    Box::new(|operand: &mut StateHandler| {
+                                        *operand = StateHandler::Init;
+                                        InstructionBuffer::default()
+                                }))?,
+                            ]);
+                            state_tx.send(state_instructions);
+                            break;
+                        }
                     }
-
-                    retrieve_graphics_cycle(&mut graphics_loop, app.graphics.as_mut().unwrap() , &window_handler.window);
-                    retrieve_data_cycle(&mut data_loop);
                 }
+
+                // Handle state transfer
+                
             },
-            GameState::Exit => {
+            StateHandler::Exit => {
                 trace!("At state exit");
-                break;
+                break 'main;
             },
-            GameState::Game => { //Holds data for normal running of the game
+            StateHandler::Game => { //Holds data for normal running of the game
                 let mut graphics_loop : Option<JoinHandle<()>> = None;
                 let mut data_loop : Option<JoinHandle<()>> = None;
                 
                 loop {
-                    //retrieve_graphics_cycle(&mut graphics_loop);
-                    retrieve_data_cycle(&mut data_loop);
+                    todo!();
                 }
             }
         };
@@ -85,57 +198,9 @@ async fn main() -> Result<()> {
 
 }
 
-enum GameState {
-    Start,
-    Init,
-    Menu,
-    Game,
-    Exit,
-}
-
-impl GameState {
-    fn new() -> Self {
-        Self::Start
-    }
-
-    fn process_state(&mut self, buffer: &mut Buffer<StateChange>) -> Result<(), InstructionErr> {
-        buffer
-            .iter()
-            .for_each(|x| {x.execute(self);});
-        Ok(())
-    }
-}
-
-struct StateChange {
-    function: Box<dyn Fn(&mut GameState) -> Result<(), InstructionErr>>,
-}
-
-impl StateChange {
-    fn new(function: Box<dyn Fn(&mut GameState) -> Result<(), InstructionErr>>) -> Self {
-        Self {function}
-    } 
-}
-
-impl Instruction for StateChange {
-    type Operand = GameState;
-
-    fn execute(&self, operand: &mut GameState) -> Result<(),InstructionErr> {
-        self.check_requirements()?;
-        (self.function)(operand)?;
-        Ok(())
-    }
-
-    fn check_requirements(&self) -> Result<(),InstructionErr> {
-        Ok(())
-    }
-}
-
 struct App {
-    graphics: Option<GraphicsHandler>,
-    data: Option<Data>,
+    
     network: Option<Network>,
-    state: GameState,
-    state_buffer: Buffer::<StateChange>,
 }
 
 struct  Graphics;
@@ -150,13 +215,8 @@ struct Network;
 
 impl App {
     fn new() -> Self {
-        let graphics = None;
-        let data = None;
         let network = None;
-        let state = GameState::new();
-        let state_buffer = Buffer::<StateChange>::new();
-        //let event_loop = EventLoop::new();
-        Self {graphics,data,network,state,state_buffer}
+        Self {network}
     }
 }
 
@@ -165,58 +225,20 @@ struct Settings {
 
 }
 
-fn retrieve_graphics_cycle(cycle: &mut Option<JoinHandle<()>>, graphics_handler: &mut GraphicsHandler, window: &Window) {
-
-    if let Some(link) = cycle {
-        if !link.is_finished() {
-            // No new cycle created
-            return;
-        }
-    }
-
-    // New cycle must be created
-    let graphics_fn = async move {
-        graphics_handler.render(window).unwrap();
-        ()
-    };
-
-    *cycle = Some(tokio::spawn(graphics_fn));
-}
-
-
-fn retrieve_data_cycle(cycle: &mut Option<JoinHandle<()>>) {
-
-    if let Some(link) = cycle {
-        if !link.is_finished() {
-            // No new cycle created
-            return;
-        }
-    }
-
-    // New cycle must be created
-    let data_fn = async {
-        sleep(Duration::from_millis(500)).await;
-                    println!("0.5 sec");
-    };
-
-    *cycle = Some(tokio::spawn(data_fn));
-}
-
-
 /// Contains all information about window control
 struct WindowHandler {
     event_loop: EventLoop<()>,
-    window: Window,
+    window: Arc<Window>,
 }
 
 /// To do: hnadle errors
 impl WindowHandler {
     fn new(title: &str, (width, height): (u32,u32)) -> Result<Self>{
         let event_loop = EventLoop::new()?;
-        let window = WindowBuilder::new()
+        let window = Arc::new(WindowBuilder::new()
             .with_title(title)
             .with_inner_size(LogicalSize::new(width,height))
-            .build(&event_loop)?;
+            .build(&event_loop)?);
     
 
         info!("Window successfully created");

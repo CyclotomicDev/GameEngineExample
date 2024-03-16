@@ -1,5 +1,7 @@
 use anyhow::{Result,anyhow};
 use winit::window::{Window, WindowBuilder};
+//use control::control::{InstructionBuffer,Instruction, Layer};
+use layers::Layer;
 
 
 pub struct GraphicsHandler {
@@ -12,12 +14,16 @@ impl GraphicsHandler {
         Ok(Self {vulkan_handler})
     }
 
-    pub fn render(&mut self, window: &Window) -> Result<()> {
+    pub async fn render(&mut self, window: &Window) -> Result<()> {
         self.vulkan_handler.render(window)?;
         Ok(())
     }
 
 
+}
+
+impl Layer for GraphicsHandler {
+    
 }
 
 

@@ -1,160 +1,142 @@
-
-
-
 pub mod control {
 
-    pub enum InstructionErr {
-        Invalid,
-        Decay, //Instruction no longer valid
-        Failure, //Instruction tried and failed to be executed
+    use anyhow::{Result, anyhow};
+    use std::{any::{Any, TypeId}, collections::VecDeque};
+
+    use graphics::GraphicsHandler;
+    use state::StateHandler;
+
+    use layers::Layer;
+
+    /*
+    impl Layer for GraphicsHandler {
+    
+    }
+    */
+
+    type Grph = InstructionHelper<GraphicsHandler>;
+    type State = InstructionHelper<StateHandler>;
+
+   
+
+    pub enum Instruction {
+        GrahpicsInst(Grph),
+        StateInst(State),
+        //Null,
     }
 
+    // Make static lifetime layers
 
-    ///Basic unit for communicating with other crates
-    pub trait Instruction {
-        type Operand;
-
-        fn execute(&self, operand: &mut <Self as Instruction>::Operand) -> Result<(),InstructionErr>;
-
-        fn check_requirements(&self) -> Result<(),InstructionErr>;
-
-    }
-/*
-    ///Buffer that handles execution of all contained instructions
-    struct InstrtuctionBuffer {
-        instructions: Vec<Box<dyn Instruction>>,
-    }
-
-    impl Instruction for InstrtuctionBuffer {
-        fn execute(&self) -> Result<(),InstructionErr> {
-            self.instructions.iter().for_each(|x| {x.execute();});
-            Ok(())
+    impl Instruction {
+        pub fn new<T: Layer>(layer_type: LayerType, func: Box<dyn Fn(&mut T) -> InstructionBuffer + Send + 'static>) -> Result<Self> {           
+            match layer_type {
+                LayerType::Graphics => {
+                    Ok(Instruction::GrahpicsInst(convert_layer_type::<GraphicsHandler>(Box::new(InstructionHelper::<T> { func }))))
+                }
+                LayerType::State => {
+                    Ok(Instruction::StateInst(convert_layer_type::<StateHandler>(Box::new(InstructionHelper::<T> { func }))))
+                },
+                _ => Err(anyhow!("Instruction is not for valid layer type"))
+            }   
+            
         }
 
-        fn check_rquirements(&self) -> bool {
-            true
-        }
-    }
-
-    //mod _helper {
-        #[derive(Hash, PartialEq, Eq)]
-        enum Location {
-            All,
-            Indentity, //To same
-            Control,
-            Data,
-            Graphics,
-        }
-        ///Determines valid route to send instructions
-        struct Relation {
-            destination: Location,
-
-        }
-
-        impl Relation {
-            fn new(destination: Location) -> Self {
-                Self {destination}
+        // Execute consumes the instruction
+        fn execute(self, layer: &mut dyn Any) -> Result<InstructionBuffer> {
+        //fn execute(&self, layer: Box<&'a mut dyn Layer>) -> Result<InstructionBuffer> {
+            match self {
+                Instruction::GrahpicsInst(inst) => 
+                    inst.execute(layer
+                        .downcast_mut::<GraphicsHandler>()
+                        .ok_or_else(|| anyhow!("Instruction type mismatch"))?),
+                Instruction::StateInst(inst) =>
+                    inst.execute(layer
+                        .downcast_mut::<StateHandler>()
+                        .ok_or_else(|| anyhow!("Instruction type mismatch"))?),
             }
         }
-    //}
-
-    struct ExternalTransferRules {
-        transfers: HashMap<Location,Relation>,
     }
 
-    impl ExternalTransferRules {
-        fn new() -> Self {
-            let mut transfers = HashMap::<Location,Relation>::new();
+    fn convert_layer_type<T: Layer>(instruction: Box<dyn Any>) -> InstructionHelper<T> {
+        *instruction.downcast::<InstructionHelper<T>>().unwrap()
+        //InstructionHelper::<T> {func: Box::new(|_| {InstructionBuffer::default()})}
+    }
 
-            use Location::*;
+    pub struct InstructionHelper<T: Layer> {
+        func: Box<dyn Fn(&mut T) -> InstructionBuffer + Send>,
+    }
 
-            transfers.insert(Control,Relation::new(All));
-
-            Self {transfers}
+    impl<T: Layer> InstructionHelper<T>
+    where
+        T: Layer
+    {
+        fn execute(self, operand: &mut T) -> Result<InstructionBuffer> {
+            Ok((self.func)(operand))
         }
     }
 
-    enum InstructionWrapper {
-        None,
-        Data(Box<dyn Instruction>),
-        Graphics(Box<dyn Instruction>),
+
+    
+
+    pub struct InstructionBuffer {
+        buffer: VecDeque<Instruction>,
     }
 
-    struct Node {
-        buffer: VecDeque<Box<dyn Instruction>>,
-    }
-
-    impl Node {
-        fn new() -> Self {
-            let buffer = VecDeque::new();
-            Self {buffer}
-        }
-    }
-
-    use std::collections::VecDeque;
-    struct ControlHandler {
-        data_buffer: Node,
-        graphics_buffer: Node,
-    }
-
-    impl ControlHandler {
-        fn new() -> Self {
-            let data_buffer = Node::new();
-            let graphics_buffer = Node::new();
-            Self {data_buffer, graphics_buffer}
+    impl InstructionBuffer {
+        pub fn new(buffer: Vec<Instruction>) -> Self {
+            Self { buffer: VecDeque::from(buffer) }
         }
 
-        fn add_instruction(&mut self, instruction: InstructionWrapper) -> Result<(), InstructionErr> {
-            match instruction {
-                InstructionWrapper::Data(inner) => {
-                    self.data_buffer.push_back(inner);
-                },
-                InstructionWrapper::Graphics(inner) => {
-                    self.graphics_buffer.push_back(inner);
-                },
-                _ => _,
-            };
-            Ok(())
+        fn combine(&mut self, mut new: InstructionBuffer) {
+            self.buffer.append(&mut new.buffer);
         }
 
-        fn organisze_buffers(&mut self) {
-
-        }
-    }
-*/
-use std::collections::VecDeque;
-
-    pub struct Buffer<T: Instruction>{
-        pub data: VecDeque<Box<T>>,
-    }
-
-    impl<T: Instruction> Buffer<T> {
-        pub fn new() -> Self {
-            let data = VecDeque::new();
-            Self {data}
-        }
-
-        pub fn push_back(&mut self, value: T) {
-            self.data.push_back(Box::<T>::new(value));
-        }
-
-        pub fn pop_front(&mut self) -> Option<T> {
-            match self.data.pop_front()
-            {
-                Some(inner) => Some(*inner),
-                None => None,
+        pub fn execute_all(&mut self, self_boxed: &mut dyn Any) -> Result<InstructionBuffer> {
+            let mut result: InstructionBuffer = InstructionBuffer::default();
+            while !self.buffer.is_empty() {
+                let instruction = self.buffer.pop_front().unwrap();
+                let buffer_segment = instruction.execute(self_boxed)?;
+                result.combine(buffer_segment);
             }
-        }
-
-        pub fn iter(&self) -> impl Iterator<Item = &Box<T>> {
-            self.data.iter()
+            Ok(result)
+            /*
+            Ok(
+                self.buffer.drain(..)
+                    .map(move |instruction: Instruction<'_> | {
+                        instruction.execute(self_boxed)
+                    })
+                    .map_while(Result::ok)
+                    .fold(InstructionBuffer::new(vec![]), |acc: InstructionBuffer, c: InstructionBuffer| acc.combine( c))
+            )
+            */
         }
     }
 
-    pub enum ModuleType {
-        Status,
-        Data,
+    impl<'a> Default for InstructionBuffer {
+        fn default() -> Self {
+        Self { buffer: VecDeque::new() }
+        }
+    }
+    
+    /*
+    pub fn execute_all<'a, 'b: 'a>(self_boxed: &'a mut dyn Any, buffer: InstructionBuffer<'b>) -> Result<InstructionBuffer<'a>> {
+        Ok(
+            buffer.buffer.iter()
+                .map(|instruction | {
+                    instruction.execute(self_boxed)
+                    //InstructionBuffer::default()
+                })
+                .map_while(Result::ok)
+                .fold(InstructionBuffer::new(vec![]), |acc: InstructionBuffer, c: InstructionBuffer| acc.combine( c))
+        )
+    }
+    */
+
+    pub enum LayerType {
         Graphics,
+        Data,
+        State,
+        Control,
     }
 
 }

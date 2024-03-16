@@ -2,6 +2,8 @@
     "rust-analyzer.linkedProjects": [
         ".\\lib\\control\\Cargo.toml",
         ".\\Cargo.toml",
-        ".\\Cargo.toml"
+        ".\\Cargo.toml",
+        ".\\lib\\layers\\Cargo.toml",
+        ".\\lib\\state\\Cargo.toml"
     ]
 }

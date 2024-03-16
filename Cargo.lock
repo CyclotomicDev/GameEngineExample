@@ -9,9 +9,11 @@ dependencies = [
  "anyhow",
  "control",
  "graphics",
+ "layers",
  "lib",
  "log",
  "simple-logging",
+ "state",
  "thiserror",
  "tokio",
  "winit",
@@ -299,6 +301,12 @@ dependencies = [
 [[package]]
 name = "control"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "graphics",
+ "layers",
+ "state",
+]
 
 [[package]]
 name = "core-foundation"
@@ -476,6 +484,7 @@ name = "graphics"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "layers",
  "log",
  "simple-logging",
  "thiserror",
@@ -546,6 +555,10 @@ checksum = "406cda4b368d531c842222cf9d2600a9a4acce8d29423695379c6868a143a9ee"
 dependencies = [
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "layers"
+version = "0.1.0"
 
 [[package]]
 name = "lazy_static"
@@ -1091,6 +1104,13 @@ checksum = "05ffd9c0a93b7543e062e759284fcf5f5e3b098501104bfbdde4d404db792871"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "state"
+version = "0.1.0"
+dependencies = [
+ "layers",
 ]
 
 [[package]]
