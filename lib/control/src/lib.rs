@@ -168,12 +168,21 @@ pub enum LayerType {
 }
 
 pub struct ControlHandler {
-
+    quit_recieved: bool,
 }
 
 impl ControlHandler {
-    pub fn quit(&self) -> InstructionBuffer {
+    pub fn new() -> Self {
+        Self {quit_recieved: false}
+    }
+
+    pub fn quit(&mut self) -> InstructionBuffer {
+        self.quit_recieved = true;
         InstructionBuffer::default()
+    }
+
+    pub fn quit_recieved(&self) -> bool {
+        self.quit_recieved
     }
 }
 

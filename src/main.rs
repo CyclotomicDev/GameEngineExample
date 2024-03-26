@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
 
     //let mut app = App::new();
 
+    /*
+
     let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
 
     let mut graphics: Arc<Mutex<Option<Box<GraphicsHandler>>>> = Arc::new(Mutex::new(None));
@@ -44,10 +46,44 @@ async fn main() -> Result<()> {
     let mut current_state: StateHandler = StateHandler::new();
     let (state_tx, mut state_rx) = mpsc::channel::<InstructionBuffer>(1);
     {state_tx.send(InstructionBuffer::default()).await};
+    */
 
+    let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
+
+    let mut graphics = Arc::new(Mutex::new(GraphicsHandler::new(&window_handler.window)?));
+    //let mut data = None;
+    let mut control = ControlHandler::new();
+
+    let graphics_future = graphics_cycle(InstructionBuffer::default(), &window_handler.window, graphics.clone());
+    let data_future = data_cycle(InstructionBuffer::default());
+    tokio::pin!(graphics_future);
+    tokio::pin!(data_future);
+
+    let mut buffer_collection = BufferColection::default(); 
     
 
     'main: loop {
+
+        handle_events(&mut window_handler.event_loop, &window_handler.window)
+            .sort(&mut buffer_collection);
+
+        buffer_collection.control_buffer.execute_all(control.as_any_mut())?;
+
+        if control.quit_recieved() {
+            break 'main;
+        }
+        
+        tokio::select! {
+            _ = &mut graphics_future => {
+                graphics_future.set(graphics_cycle(InstructionBuffer::default(), &window_handler.window, graphics.clone()))
+            }
+        }
+
+
+
+
+        {
+            /*
         // Goes through state buffer to get current state
         
         //current_state.execute_all(state_rx.recv().await.unwrap());
@@ -233,10 +269,24 @@ async fn main() -> Result<()> {
                 }
             }
         };
+        */
+    }
     }
 
     Ok(())
 
+}
+
+async fn graphics_cycle(instructions: InstructionBuffer, window: &Window, graphics: Arc<Mutex<GraphicsHandler>>) -> Result<InstructionBuffer> {
+    let mut graphics = graphics.lock().await;
+
+    graphics.render(window)?;
+
+    Ok(InstructionBuffer::default())
+}
+
+async fn data_cycle(instructions: InstructionBuffer) -> InstructionBuffer {
+    todo!()
 }
 
 /// Contains all information about window control
@@ -262,7 +312,8 @@ impl WindowHandler {
 }
 
 // May need to add error handling
-fn handle_events(event_loop: &mut EventLoop<()>, window: Arc<Window>) -> InstructionBuffer {
+//fn handle_events(event_loop: &mut EventLoop<()>, window: Arc<Window>) -> InstructionBuffer {
+fn handle_events(event_loop: &mut EventLoop<()>, window: &Window) -> InstructionBuffer {
     let mut buffer = InstructionBuffer::default();
     let timeout = Some(Duration::ZERO);
     let _status = event_loop.pump_events(timeout, |event, elwt| {
@@ -287,4 +338,6 @@ fn handle_events(event_loop: &mut EventLoop<()>, window: Arc<Window>) -> Instruc
     });
 
     buffer
+    
 }
+
