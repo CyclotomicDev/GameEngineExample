@@ -1,6 +1,5 @@
-[00:00:00.066] (2f2c) INFO   Window successfully created
-[00:00:00.066] (2f2c) INFO   At state start
-[00:00:10.666] (2f2c) WARN   Skipping physical device (`Intel(R) Iris(R) Xe Graphics`): Missing Only discrete GPUs are supported
-[00:00:10.685] (2f2c) INFO   Selected physical device (`NVIDIA GeForce RTX 3070 Ti Laptop GPU`)
-[00:00:11.449] (2f2c) INFO   Successful loading of Vulkan
-[00:00:46.906] (2f2c) INFO   Close window; Exit code 0
+[00:00:00.084] (3ca0) INFO   Window successfully created
+[00:00:00.084] (3ca0) INFO   At state start
+[00:00:11.716] (3ca0) WARN   Skipping physical device (`Intel(R) Iris(R) Xe Graphics`): Missing Only discrete GPUs are supported
+[00:00:11.738] (3ca0) INFO   Selected physical device (`NVIDIA GeForce RTX 3070 Ti Laptop GPU`)
+[00:00:12.478] (3ca0) INFO   Successful loading of Vulkan

@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.80"
+winit = "0.29.11"
 graphics = {path = "../graphics"}
 layers = {path = "../layers"}
 state = {path = "../state"}
+data = {path = "../data"}

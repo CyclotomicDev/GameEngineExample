@@ -4,6 +4,7 @@
         ".\\Cargo.toml",
         ".\\Cargo.toml",
         ".\\lib\\layers\\Cargo.toml",
-        ".\\lib\\state\\Cargo.toml"
+        ".\\lib\\state\\Cargo.toml",
+        ".\\lib\\data\\Cargo.toml"
     ]
 }

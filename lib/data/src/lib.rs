@@ -1,14 +1,16 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
+use anyhow::Result;
+use layers::Layer;
+
+pub struct DataHandler {
+
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+impl DataHandler {
+    pub fn new() -> Result<Self> {
+        Ok(Self{})
     }
+}
+
+impl Layer for DataHandler {
+    
 }

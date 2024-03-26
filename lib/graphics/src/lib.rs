@@ -14,7 +14,8 @@ impl GraphicsHandler {
         Ok(Self {vulkan_handler})
     }
 
-    pub async fn render(&mut self, window: &Window) -> Result<()> {
+    pub fn render(&mut self, window: &Window) -> Result<()> {
+        println!("Render");
         self.vulkan_handler.render(window)?;
         Ok(())
     }

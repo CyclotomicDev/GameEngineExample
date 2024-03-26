@@ -9,6 +9,7 @@ edition = "2021"
 lib = {path = "lib"}
 control = {path = "lib/control"}
 graphics = {path = "lib/graphics"}
+data = {path = "lib/data"}
 layers = {path = "lib/layers"}
 state = {path = "lib/state"}
 winit = "0.29.11"

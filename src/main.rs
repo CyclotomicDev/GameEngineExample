@@ -1,6 +1,8 @@
 //use winit::event_loop::{ControlFlow, EventLoop};
-use control::control::*;
+use control::*;
 use graphics::GraphicsHandler;
+use data::DataHandler;
+use control::ControlHandler;
 use layers::{AnyLayer, Layer};
 use state::StateHandler;
 use tokio::sync::mpsc::error::SendError;
@@ -10,10 +12,11 @@ use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::task::Poll;
+use std::mem;
 use std::time::Duration;
 use tokio::{task::JoinHandle, time::sleep, sync::mpsc, join};
 use tokio::sync::{Mutex, RwLock};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering::Relaxed}};
 use winit::dpi::LogicalSize;
 use winit::event_loop::{self, EventLoop};
 use winit::event::{Event, WindowEvent};
@@ -29,12 +32,13 @@ async fn main() -> Result<()> {
     simple_logging::log_to_file("test.log", LevelFilter::Info)?;
 
 
-    let mut app = App::new();
+    //let mut app = App::new();
 
     let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
 
     let mut graphics: Arc<Mutex<Option<Box<GraphicsHandler>>>> = Arc::new(Mutex::new(None));
-    let mut data: Option<Data> = None;
+    let mut data: Arc<Mutex<Option<Box<DataHandler>>>> = Arc::new(Mutex::new(None));
+    //let mut data: Option<Data> = None;
 
     //let mut current_state: Box<GameState> = Box::new(GameState::new());
     let mut current_state: StateHandler = StateHandler::new();
@@ -69,6 +73,10 @@ async fn main() -> Result<()> {
                 let mut graphics = graphics.lock().await;
                 *graphics = Some(Box::new(GraphicsHandler::new(&window)?));
                 info!("Successful loading of Vulkan");
+
+                // Empty data init
+                let mut data = data.lock().await;
+                *data = Some(Box::new(DataHandler::new()?));
                 
                 let state_instructions = InstructionBuffer::new(vec![
                     Instruction::new(
@@ -83,7 +91,10 @@ async fn main() -> Result<()> {
             StateHandler::Menu => { // Main menu - controls all main paths
 
                 {
+                    let continue_loop_master = Arc::new(AtomicBool::new(true));
+                    
                     let mut graphics = graphics.clone();
+                    let mut data = data.clone();
 
                     let window = window_handler.window.clone();
 
@@ -91,24 +102,25 @@ async fn main() -> Result<()> {
                     let ctrl_window = window.clone();
 
                     // Channel from All to Control
-                    let (ctrl_tx, ctrl_rx) = mpsc::channel::<InstructionBuffer>(10);
+                    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<InstructionBuffer>(10);
 
                     // Channel from Control to Grahpics
                     let (grph_tx, mut grph_rx) = mpsc::channel::<InstructionBuffer>(1);
                     
+                    let continue_loop = continue_loop_master.clone();
                     //let mut graphics = graphics.as_mut().unwrap();
                     let graphics_loop = async move {
                         println!("Graphics loop start");
                         let mut graphics = graphics.lock().await;
                         let graphics = graphics.as_mut().unwrap();
-                        loop {
+                        
+                        while continue_loop.load(Relaxed) {
                             // Control
                             let mut crtl_instructions = grph_rx.recv().await.unwrap();
 
                             
                             
                             // Execute instructions
-                            
                             crtl_instructions.execute_all(graphics.as_any_mut());
                             
                             
@@ -120,11 +132,19 @@ async fn main() -> Result<()> {
                         ()
                     };
 
-                    let (data_in, mut data_out) = mpsc::channel::<InstructionBuffer>(1);
-                    let data_loop = async {
+                    let continue_loop = continue_loop_master.clone();
+                    let (data_tx, mut data_rx) = mpsc::channel::<InstructionBuffer>(1);
+                    let data_loop = async move {
                         println!("Data loop start");
-                        loop {
+                        let mut data = data.lock().await;
+                        let data = data.as_mut().unwrap();
+                        while continue_loop.load(Relaxed) {
                             // Control
+                            let mut data_instructions = data_rx.recv().await.unwrap();
+
+
+                            // Execute instructions
+                            data_instructions.execute_all(data.as_any_mut());
 
                             // Execute data
                             println!("1s");
@@ -133,33 +153,50 @@ async fn main() -> Result<()> {
 
                         ()
                     };
+                    let (inpt_tx, mut inpt_rx) = mpsc::channel::<InstructionBuffer>(1);
+
+                    let continue_loop = continue_loop_master.clone();
+
+                    let state_tx = state_tx.clone();
 
                     // Schedules all instructions and timing
                     let control_loop = async move {
+
+                        let mut buffer_collection = BufferColection::default();
+                        let state_tx = state_tx.clone();
                         
-                        todo!();
+                        while continue_loop.load(Relaxed) {
+                            // Wait for new InstructionBuffer
+                            let mut current_buffer = match ctrl_rx.try_recv() {
+                                Ok(buffer) => buffer,
+                                Err(_) => InstructionBuffer::default(),
+                            };
+
+
+                            // Seperate into layer-specific instructions
+                            current_buffer.sort(&mut buffer_collection);
+
+                            // Handle giving instructions to each layer
+                            grph_tx.send(mem::take(&mut buffer_collection.graphics_buffer)).await;
+                            state_tx.send(mem::take(&mut buffer_collection.state_buffer)).await;
+                            data_tx.send(mem::take(&mut buffer_collection.state_buffer)).await;
+
+                        }
                     };
 
                     let graphics_loop = tokio::spawn(graphics_loop);
                     let data_loop = tokio::spawn(data_loop);
-                    //let control_loop = tokio::spawn(control_loop);
+                    let control_loop = tokio::spawn(control_loop);
+
+                    let continue_loop = continue_loop_master.clone();
+
+
 
                     // Handle window events
-                    loop {
-                        let timeout = Some(Duration::ZERO);
-                        let status = window_handler.event_loop.pump_events(timeout, |event, elwt| {
-                            match event {
-                                Event::WindowEvent { 
-                                    event: WindowEvent::CloseRequested, 
-                                    window_id,
-                                } if window_id == window.id() => elwt.exit(),
-                                Event::AboutToWait => {
-                                    window_handler.window.request_redraw();
-                                },
-                                _ => (),
-                            }
-                        });
-
+                    while continue_loop.load(Relaxed) {
+                        ctrl_tx.send(handle_events(&mut window_handler.event_loop, window_handler.window.clone())).await;
+                        println!("Handle events");
+                        /*
                         if let PumpStatus::Exit(exit_code) = status {
                             info!("Close window; Exit code {}",exit_code);
                             let state_instructions = InstructionBuffer::new(vec![
@@ -173,7 +210,10 @@ async fn main() -> Result<()> {
                             state_tx.send(state_instructions);
                             break;
                         }
+                        */
                     }
+
+                    join!(graphics_loop, data_loop, control_loop);
                 }
 
                 // Handle state transfer
@@ -181,6 +221,7 @@ async fn main() -> Result<()> {
             },
             StateHandler::Exit => {
                 trace!("At state exit");
+
                 break 'main;
             },
             StateHandler::Game => { //Holds data for normal running of the game
@@ -195,33 +236,6 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-
-}
-
-struct App {
-    
-    network: Option<Network>,
-}
-
-struct  Graphics;
-
-
-impl Graphics {
-    
-}
-
-struct  Data;
-struct Network;
-
-impl App {
-    fn new() -> Self {
-        let network = None;
-        Self {network}
-    }
-}
-
-struct Settings {
-
 
 }
 
@@ -245,4 +259,32 @@ impl WindowHandler {
 
         Ok(Self {event_loop, window})
     }
+}
+
+// May need to add error handling
+fn handle_events(event_loop: &mut EventLoop<()>, window: Arc<Window>) -> InstructionBuffer {
+    let mut buffer = InstructionBuffer::default();
+    let timeout = Some(Duration::ZERO);
+    let _status = event_loop.pump_events(timeout, |event, elwt| {
+        match event {
+            Event::WindowEvent { 
+                event: WindowEvent::CloseRequested, 
+                window_id,
+            } if window_id == window.id() => {
+                elwt.exit();
+                buffer.push_back(Instruction::new(
+                    LayerType::Control, 
+                    Box::new(|control: &mut ControlHandler| {
+                        control.quit()
+                    }),
+                ).unwrap());
+            },
+            Event::AboutToWait => {
+                window.request_redraw();
+            },
+            _ => (),
+        }
+    });
+
+    buffer
 }
