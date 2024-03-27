@@ -2,23 +2,37 @@ use anyhow::{Result,anyhow};
 use winit::window::{Window, WindowBuilder};
 //use control::control::{InstructionBuffer,Instruction, Layer};
 use layers::Layer;
+use tokio::sync::Mutex;
 
 
+// Warning: minimized not handles properly, may need resructuring
 pub struct GraphicsHandler {
     vulkan_handler: vulkan::VulkanHandler,
+    minimized: bool,
 }
 
 impl GraphicsHandler {
     pub fn new(window: &Window) -> Result<Self> {
         let vulkan_handler = vulkan::VulkanHandler::new(window)?;
-        Ok(Self {vulkan_handler})
+        let minimized = false;
+        Ok(Self {vulkan_handler, minimized})
     }
 
     pub fn render(&mut self, window: &Window) -> Result<()> {
-        self.vulkan_handler.render(window)?;
+        if !self.minimized { // Does not render while minimized
+            self.vulkan_handler.render(window)?;
+        } 
+        
         Ok(())
     }
 
+    pub fn set_resized(&mut self) {
+        self.vulkan_handler.set_resized();
+    }
+
+    pub fn set_minisized(&mut self, status: bool) {
+        self.minimized = status;
+    }
 
 }
 
@@ -31,18 +45,20 @@ impl Layer for GraphicsHandler {
 mod vulkan {
     // General imports
     use winit::window::{Window, WindowBuilder};
-    use anyhow::{anyhow, Context, Ok, Result};
+    use anyhow::{anyhow, Context, Result};
     use thiserror::Error;
     use log::*;
 
     use vulkanalia::loader::{LibloadingLoader, LIBRARY};
     use vulkanalia::{bytecode, window as vk_window};
     use vulkanalia::prelude::v1_0::*;
-    use vulkanalia::vk::{ExtDebugUtilsExtension, KhrSurfaceExtension, KhrSwapchainExtension, PipelineColorBlendAttachmentState};
+    use vulkanalia::vk::{ExtDebugUtilsExtension, Image, ImageView, KhrSurfaceExtension, KhrSwapchainExtension, PipelineColorBlendAttachmentState};
 
     use std::collections::HashSet;
     use std::ffi::CStr;
     use std::os::raw::c_void;
+
+    const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
     
     // Compatibility
@@ -89,39 +105,95 @@ mod vulkan {
     pub struct VulkanHandler {
         device: DeviceWrapper, // Requires instance
         instance: InstanceWrapper,
+        frame: usize,
+        resized: bool,
     }
+
+    
 
     impl VulkanHandler {
         pub fn new(window: &Window) -> Result<Self> {
             let instance = InstanceWrapper::new(window)?;
             let device = DeviceWrapper::new(&instance, window)?;
-            Ok(Self {instance, device})
+            Ok(Self {instance, device, frame: 0, resized: false})
         }
 
         pub fn render(&mut self, window: &Window) -> Result<()> {
-            let image_available_semaphore = self.device.command.image_available_semaphore;
-            let render_finsished_semaphore = self.device.command.render_finished_semaphore;
-            
-            let swapchain = self.device.swapchain.swapchain;
+            let logical_device = &self.device.logical_device;
+            let image_available_semaphores = &self.device.command.image_available_semaphores;
+            let render_finsished_semaphores = &self.device.command.render_finished_semaphores;
+            let in_flight_fences = &self.device.command.in_flight_fences;
+            let images_in_flight = &mut self.device.command.images_in_flight;
+            let frame = self.frame;
+
+            // Wait for other frames to be completed; safety: both device and in_flight_fences created
+            unsafe {
+                self.device.logical_device.wait_for_fences(
+                    &[in_flight_fences[frame]], 
+                    true, 
+                    u64::MAX,
+                )?
+            };
 
             // 1. Aquire image from swapchain
+
+            
+            let result = unsafe {
+                logical_device.acquire_next_image_khr(
+                    self.device.swapchain.swapchain, 
+                    u64::MAX, 
+                    self.device.command.image_available_semaphores[frame], 
+                    vk::Fence::null()
+                )
+            };
+
+            // Check if swapchain needs to be recreated (e.g. window resize)
+            let image_index = match result {
+                Ok((image_index, _)) => image_index as usize,
+                Err(vk::ErrorCode::OUT_OF_DATE_KHR) => return  self.device.recreate_swapchain(&self.instance, window),
+                Err(e) => return  Err(anyhow!(e)),
+            };
+
+            // Safety: Each fence must not be currently associated with any queue command that has not completed execution
+            unsafe {
+                logical_device.reset_fences(&[in_flight_fences[frame]])?
+            };
+
+
+            let swapchain = self.device.swapchain.swapchain;
+
+            
+            /*
             let image_index = unsafe {
-                self.device.logical_device
+                logical_device
                     .acquire_next_image_khr(
                         swapchain, 
                         u64::MAX, 
-                        image_available_semaphore, 
+                        image_available_semaphores[self.frame], 
                         vk::Fence::null(),
                     )?
                     .0 as usize
             };
+            */
+
+            if !images_in_flight[image_index].is_null() {
+                unsafe {
+                    logical_device.wait_for_fences(
+                        &[images_in_flight[image_index]],
+                        true, 
+                        u64::MAX,
+                    )?;
+                }
+            }
+
+            images_in_flight[image_index] = in_flight_fences[frame];
 
             // 2. Execute command buffer with image as attachment in the framebuffer
 
-            let wait_semaphores = &[image_available_semaphore];
+            let wait_semaphores = &[image_available_semaphores[self.frame]];
             let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let command_buffers = &[self.device.command.command_buffers[image_index as usize]];
-            let signal_semaphores = &[render_finsished_semaphore];
+            let signal_semaphores = &[render_finsished_semaphores[self.frame]];
             let submit_info = vk::SubmitInfo::builder()
                 .wait_semaphores(wait_semaphores)
                 .wait_dst_stage_mask(wait_stages)
@@ -129,7 +201,10 @@ mod vulkan {
                 .signal_semaphores(signal_semaphores);
 
             unsafe {
-                self.device.logical_device.queue_submit(self.device.graphics_queue, &[submit_info], vk::Fence::null())?  
+                self.device.logical_device.queue_submit(
+                    self.device.graphics_queue, 
+                    &[submit_info], 
+                    in_flight_fences[self.frame])?  
             };
 
             let swapchains = &[swapchain];
@@ -139,19 +214,38 @@ mod vulkan {
                 .swapchains(swapchains)
                 .image_indices(image_indices);
 
-            unsafe {
-                self.device.logical_device.queue_present_khr(self.device.present_queue, &present_info)?;
+            let result = unsafe {
+                self.device.logical_device.queue_present_khr(self.device.present_queue, &present_info)
+            };
+
+            // Handled after queue_present_khr to ensure semaphores in consitent state
+            let changed = result == Ok(vk::SuccessCode::SUBOPTIMAL_KHR)
+                || result == Err(vk::ErrorCode::OUT_OF_DATE_KHR);
+
+            if self.resized || changed {
+                self.resized = false;
+                self.device.recreate_swapchain(&self.instance, window)?;
+            } else if let Err(e) = result {
+                return Err(anyhow!(e));
             }
+
+            // Advance to next frame
+            self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
             Ok(())
         }
-    
+
+        pub fn set_resized(&mut self) {
+            self.resized = true;
+        }
         
     }
 
     impl Drop for VulkanHandler {
         fn drop(&mut self) {
-            
+            unsafe {
+                self.device.logical_device.device_wait_idle().unwrap();
+            }
         }
     }
 
@@ -475,7 +569,35 @@ mod vulkan {
 
             Ok(framebuffers)
         }
-   
+
+        fn recreate_swapchain(&mut self, instance: &InstanceWrapper, window: &Window) -> Result<()> {
+            
+            unsafe {
+                self.logical_device.device_wait_idle()?
+            };
+            self.destroy_swapchain();
+
+
+            self.swapchain = SwapchainWrapper::new(instance, self.physical_device, &self.logical_device, window)?;
+            self.pipeline = PipelineWrapper::new(&self.logical_device, self.swapchain.swapchain_extent, self.swapchain.swapchain_format)?;
+            self.framebuffers = DeviceWrapper::create_framebuffers(&self.logical_device, &self.swapchain, &self.pipeline.render_pass)?;
+            self.command = CommandWrapper::new(&instance, self.physical_device, &self.logical_device, &self.framebuffers, &self.swapchain, &self.pipeline)?;
+            self.command.images_in_flight.resize(self.swapchain.swapchain_images.len(), vk::Fence::null());
+            Ok(())
+        }
+
+        fn destroy_swapchain(&mut self) {
+            unsafe {
+                self.framebuffers
+                    .drain(..)
+                    .for_each(|f| self.logical_device.destroy_framebuffer(f, None));
+            }
+            self.swapchain.destroy(&self.logical_device);
+            self.pipeline.destroy(&self.logical_device);
+            
+            self.command.destroy(&self.logical_device);
+
+        }
         
     }
 
@@ -673,16 +795,18 @@ mod vulkan {
                 logical_device.get_swapchain_images_khr(swapchain)?
             };
 
-            let swapchain_image_views = {
-                swapchain_images
-                    .iter()
-                    .map(|i| {
-                        SwapchainWrapper::create_image_view(surface_format.format, logical_device, *i, vk::ImageAspectFlags::COLOR)
-                    })
-                    .collect::<Result<Vec<_>,_>>()?
-            };
+            let swapchain_image_views = SwapchainWrapper::create_swapchain_image_views(surface_format.format, &swapchain_images, logical_device)?;
 
             Ok(Self { swapchain_format: surface_format.format, swapchain_extent, swapchain, swapchain_images, swapchain_image_views })
+        }
+
+        fn create_swapchain_image_views(swapchain_format: vk::Format, swapchain_images: &Vec<Image>,logical_device: &Device) -> Result<Vec<ImageView>> {
+            Ok(swapchain_images
+                    .iter()
+                    .map(|i| {
+                        SwapchainWrapper::create_image_view(swapchain_format, logical_device, *i, vk::ImageAspectFlags::COLOR)
+                    })
+                    .collect::<Result<Vec<_>,_>>()?)
         }
 
         fn create_image_view(swapchain_format: vk::Format, logical_device: &Device, image: vk::Image, aspects: vk::ImageAspectFlags) -> Result<vk::ImageView> {
@@ -922,9 +1046,12 @@ mod vulkan {
     struct CommandWrapper {
         command_pool: vk::CommandPool,
         command_buffers: Vec<vk::CommandBuffer>,
-        // Semaphores to control syncronization
-        image_available_semaphore: vk::Semaphore,
-        render_finished_semaphore: vk::Semaphore,
+        // Semaphores to control GPU syncronization
+        image_available_semaphores: Vec<vk::Semaphore>,
+        render_finished_semaphores: Vec<vk::Semaphore>,
+        // Fences to control CPU syncronization
+        in_flight_fences: Vec<vk::Fence>,
+        images_in_flight: Vec<vk::Fence>,
     }
 
     impl CommandWrapper {
@@ -932,16 +1059,35 @@ mod vulkan {
             let command_pool = CommandWrapper::create_command_pool(instance, physical_device, logical_device)?;
             let command_buffers  =CommandWrapper::create_command_buffers(logical_device, command_pool, framebuffers, swapchain, pipeline)?;
 
-            let (image_available_semaphore, render_finished_semaphore) = unsafe {
+            let (image_available_semaphores, render_finished_semaphores, in_flight_fences) = unsafe {
                 let semaphore_info = vk::SemaphoreCreateInfo::builder();
+                let fence_info = vk::FenceCreateInfo::builder()
+                    .flags(vk::FenceCreateFlags::SIGNALED); // Want to have fences appear as if just complete frame at start rather than causing wait for non-existant frame
 
-                let image_available_semaphore = logical_device.create_semaphore(&semaphore_info, None)?;
-                let render_finished_semaphore = logical_device.create_semaphore(&semaphore_info, None)?;
+                let mut image_available_semaphores = Vec::new();
+                let mut render_finished_semaphores = Vec::new();
 
-                (image_available_semaphore, render_finished_semaphore)
+                let mut in_flight_fences = Vec::new();
+
+                for _ in 0..MAX_FRAMES_IN_FLIGHT {
+                    image_available_semaphores
+                        .push(logical_device.create_semaphore(&semaphore_info, None)?);
+                    render_finished_semaphores
+                        .push(logical_device.create_semaphore(&semaphore_info, None)?);
+                
+                    in_flight_fences
+                        .push(logical_device.create_fence(&fence_info, None)?);
+                }
+
+                (image_available_semaphores, render_finished_semaphores, in_flight_fences)
             };
 
-            Ok(Self { command_pool, command_buffers, image_available_semaphore, render_finished_semaphore })
+            let images_in_flight = swapchain.swapchain_images
+                .iter()
+                .map(|_| vk::Fence::null())
+                .collect();
+
+            Ok(Self { command_pool, command_buffers, image_available_semaphores, render_finished_semaphores, in_flight_fences, images_in_flight })
         }
 
         fn create_command_pool(instance: &InstanceWrapper, physical_device: vk::PhysicalDevice, logical_device: &Device) -> Result<vk::CommandPool> {
@@ -1013,9 +1159,16 @@ mod vulkan {
             
             unsafe {
                 // Semaphores must match ones created
-
-                logical_device.destroy_semaphore(self.render_finished_semaphore, None);
-                logical_device.destroy_semaphore(self.image_available_semaphore, None);
+                self.render_finished_semaphores
+                    .drain(..)
+                    .for_each(|s| logical_device.destroy_semaphore(s, None));
+                self.image_available_semaphores
+                    .drain(..)
+                    .for_each(|s| logical_device.destroy_semaphore(s, None));
+                
+                self.in_flight_fences
+                    .drain(..)
+                    .for_each(|f| logical_device.destroy_fence(f, None));
 
                 logical_device.destroy_command_pool(self.command_pool, None);
             }

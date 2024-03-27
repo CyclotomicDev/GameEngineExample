@@ -499,6 +499,7 @@ dependencies = [
  "log",
  "simple-logging",
  "thiserror",
+ "tokio",
  "vulkanalia",
  "winit",
 ]

@@ -50,12 +50,12 @@ async fn main() -> Result<()> {
 
     let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
 
-    let mut graphics = Arc::new(Mutex::new(GraphicsHandler::new(&window_handler.window)?));
-    //let mut data = None;
+    let graphics = Arc::new(Mutex::new(GraphicsHandler::new(&window_handler.window)?));
+    let data = Arc::new(Mutex::new(DataHandler::new()?));
     let mut control = ControlHandler::new();
 
     let graphics_future = graphics_cycle(InstructionBuffer::default(), &window_handler.window, graphics.clone());
-    let data_future = data_cycle(InstructionBuffer::default());
+    let data_future = data_cycle(InstructionBuffer::default(), data.clone());
     tokio::pin!(graphics_future);
     tokio::pin!(data_future);
 
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
 
     'main: loop {
 
-        handle_events(&mut window_handler.event_loop, &window_handler.window)
+        handle_events(&mut window_handler.event_loop, &window_handler.window).await?
             .sort(&mut buffer_collection);
 
         buffer_collection.control_buffer.execute_all(control.as_any_mut())?;
@@ -74,8 +74,11 @@ async fn main() -> Result<()> {
         }
         
         tokio::select! {
-            _ = &mut graphics_future => {
+            current_graphics_buffer = &mut graphics_future => {
                 graphics_future.set(graphics_cycle(InstructionBuffer::default(), &window_handler.window, graphics.clone()))
+            }
+            _ = &mut data_future => {
+                data_future.set(data_cycle(InstructionBuffer::default(), data.clone()))
             }
         }
 
@@ -277,16 +280,26 @@ async fn main() -> Result<()> {
 
 }
 
-async fn graphics_cycle(instructions: InstructionBuffer, window: &Window, graphics: Arc<Mutex<GraphicsHandler>>) -> Result<InstructionBuffer> {
+async fn graphics_cycle(mut instructions: InstructionBuffer, window: &Window, graphics: Arc<Mutex<GraphicsHandler>>) -> Result<InstructionBuffer> {
     let mut graphics = graphics.lock().await;
+
+    instructions.execute_all(graphics.as_any_mut());
 
     graphics.render(window)?;
 
     Ok(InstructionBuffer::default())
 }
 
-async fn data_cycle(instructions: InstructionBuffer) -> InstructionBuffer {
-    todo!()
+async fn data_cycle(mut instructions: InstructionBuffer, data: Arc<Mutex<DataHandler>>) -> Result<InstructionBuffer> {
+    let mut data = data.lock().await;
+
+    instructions.execute_all(data.as_any_mut());
+
+    println!("Data pass");
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    Ok(InstructionBuffer::default())
 }
 
 /// Contains all information about window control
@@ -313,10 +326,10 @@ impl WindowHandler {
 
 // May need to add error handling
 //fn handle_events(event_loop: &mut EventLoop<()>, window: Arc<Window>) -> InstructionBuffer {
-fn handle_events(event_loop: &mut EventLoop<()>, window: &Window) -> InstructionBuffer {
+async fn handle_events(event_loop: &mut EventLoop<()>, window: &Window) -> Result<InstructionBuffer> {
     let mut buffer = InstructionBuffer::default();
     let timeout = Some(Duration::ZERO);
-    let _status = event_loop.pump_events(timeout, |event, elwt| {
+    let _status = event_loop.pump_events(timeout,  |event, elwt|   {
         match event {
             Event::WindowEvent { 
                 event: WindowEvent::CloseRequested, 
@@ -333,11 +346,27 @@ fn handle_events(event_loop: &mut EventLoop<()>, window: &Window) -> Instruction
             Event::AboutToWait => {
                 window.request_redraw();
             },
+            Event::WindowEvent { event: WindowEvent::Resized(size), .. } => {
+                // Handle window minimized
+                if size.width == 0 || size.height == 0 {
+                        buffer.push_back(Instruction::new(LayerType::Graphics, Box::new(|graphics: &mut GraphicsHandler| {
+                            graphics.set_minisized(true);
+                            InstructionBuffer::default()
+                    })).unwrap())
+                } else {
+                    buffer.push_back(Instruction::new(LayerType::Graphics, Box::new(|graphics: &mut GraphicsHandler| {
+                        graphics.set_resized();
+                        graphics.set_minisized(false);
+                        InstructionBuffer::default()
+                    })).unwrap())
+                }
+                
+            },
             _ => (),
         }
     });
 
-    buffer
+    Ok(buffer)
     
 }
 
