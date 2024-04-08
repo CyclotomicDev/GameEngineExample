@@ -105,10 +105,11 @@ mod vulkan {
 
    // Note: drop executed in order first to last
     pub struct VulkanHandler {
-        device: Arc<DeviceWrapper>, // Requires instance
-        instance: InstanceWrapper,
-        vertex_buffer: VertexBuffer,
         recreate: RecreateWrapper, // Handles objects that may be recreated
+        vertex_buffer: VertexBuffer,
+        device: Arc<DeviceWrapper>, // Destroyed after all other objects
+        instance: InstanceWrapper, // Destroyed after device
+        
         frame: usize,
         resized: bool,
     }
@@ -1323,6 +1324,10 @@ mod vulkan {
 
             let buffer_memory = unsafe {
                 device.allocate_memory(&memory_info, None)?  
+            };
+
+            unsafe {
+                device.bind_buffer_memory(buffer,buffer_memory, 0)?  
             };
 
             Ok(Self { buffer_memory, buffer, buffer_info, device })
