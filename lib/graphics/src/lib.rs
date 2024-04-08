@@ -48,15 +48,17 @@ mod vulkan {
     use anyhow::{anyhow, Context, Result};
     use thiserror::Error;
     use log::*;
+    use std::sync::Arc;
 
     use vulkanalia::loader::{LibloadingLoader, LIBRARY};
     use vulkanalia::{bytecode, window as vk_window};
     use vulkanalia::prelude::v1_0::*;
-    use vulkanalia::vk::{ExtDebugUtilsExtension, Image, ImageView, KhrSurfaceExtension, KhrSwapchainExtension, PipelineColorBlendAttachmentState};
+    use vulkanalia::vk::{BufferCreateInfoBuilder, ExtDebugUtilsExtension, Image, ImageView, KhrSurfaceExtension, KhrSwapchainExtension, MemoryPropertyFlags, PipelineColorBlendAttachmentState};
 
     use std::collections::HashSet;
     use std::ffi::CStr;
     use std::os::raw::c_void;
+    use std::ops::{Deref, DerefMut};
 
     const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
@@ -103,27 +105,36 @@ mod vulkan {
 
    // Note: drop executed in order first to last
     pub struct VulkanHandler {
-        device: DeviceWrapper, // Requires instance
+        device: Arc<DeviceWrapper>, // Requires instance
         instance: InstanceWrapper,
+        vertex_buffer: VertexBuffer,
+        recreate: RecreateWrapper, // Handles objects that may be recreated
         frame: usize,
         resized: bool,
     }
 
-    
-
     impl VulkanHandler {
         pub fn new(window: &Window) -> Result<Self> {
             let instance = InstanceWrapper::new(window)?;
-            let device = DeviceWrapper::new(&instance, window)?;
-            Ok(Self {instance, device, frame: 0, resized: false})
+            let device = Arc::new(DeviceWrapper::new(&instance, window)?);
+            let vertex_buffer = VertexBuffer::new(&instance, device.clone())?;
+            let recreate = RecreateWrapper::new(device.clone(), &instance, window, &vertex_buffer)?;
+
+            /*
+            let swapchain = SwapchainWrapper::new(&instance, device.clone() , window)?;
+            let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format)?;
+            let framebuffers = DeviceWrapper::create_framebuffers(&logical_device, &swapchain, &pipeline.render_pass)?;
+            let command = CommandWrapper::new(&instance, physical_device, &logical_device, &framebuffers, &swapchain, &pipeline, &vertex_buffer)?;
+            */
+            Ok(Self {instance, device, frame: 0, resized: false,vertex_buffer, recreate })
         }
 
         pub fn render(&mut self, window: &Window) -> Result<()> {
             let logical_device = &self.device.logical_device;
-            let image_available_semaphores = &self.device.command.image_available_semaphores;
-            let render_finsished_semaphores = &self.device.command.render_finished_semaphores;
-            let in_flight_fences = &self.device.command.in_flight_fences;
-            let images_in_flight = &mut self.device.command.images_in_flight;
+            let image_available_semaphores = &self.recreate.command.image_available_semaphores;
+            let render_finsished_semaphores = &self.recreate.command.render_finished_semaphores;
+            let in_flight_fences = &self.recreate.command.in_flight_fences;
+            let images_in_flight = &mut self.recreate.command.images_in_flight;
             let frame = self.frame;
 
             // Wait for other frames to be completed; safety: both device and in_flight_fences created
@@ -140,9 +151,9 @@ mod vulkan {
             
             let result = unsafe {
                 logical_device.acquire_next_image_khr(
-                    self.device.swapchain.swapchain, 
+                    self.recreate.swapchain.swapchain, 
                     u64::MAX, 
-                    self.device.command.image_available_semaphores[frame], 
+                    self.recreate.command.image_available_semaphores[frame], 
                     vk::Fence::null()
                 )
             };
@@ -150,7 +161,7 @@ mod vulkan {
             // Check if swapchain needs to be recreated (e.g. window resize)
             let image_index = match result {
                 Ok((image_index, _)) => image_index as usize,
-                Err(vk::ErrorCode::OUT_OF_DATE_KHR) => return  self.device.recreate_swapchain(&self.instance, window),
+                Err(vk::ErrorCode::OUT_OF_DATE_KHR) => return  self.recreate_swapchain(window),
                 Err(e) => return  Err(anyhow!(e)),
             };
 
@@ -160,7 +171,7 @@ mod vulkan {
             };
 
 
-            let swapchain = self.device.swapchain.swapchain;
+            let swapchain = self.recreate.swapchain.swapchain;
 
             
             /*
@@ -192,7 +203,7 @@ mod vulkan {
 
             let wait_semaphores = &[image_available_semaphores[self.frame]];
             let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let command_buffers = &[self.device.command.command_buffers[image_index as usize]];
+            let command_buffers = &[self.recreate.command.command_buffers[image_index as usize]];
             let signal_semaphores = &[render_finsished_semaphores[self.frame]];
             let submit_info = vk::SubmitInfo::builder()
                 .wait_semaphores(wait_semaphores)
@@ -224,7 +235,7 @@ mod vulkan {
 
             if self.resized || changed {
                 self.resized = false;
-                self.device.recreate_swapchain(&self.instance, window)?;
+                self.recreate_swapchain(window)?;
             } else if let Err(e) = result {
                 return Err(anyhow!(e));
             }
@@ -239,12 +250,75 @@ mod vulkan {
             self.resized = true;
         }
         
+
+        fn recreate_swapchain(&mut self, window: &Window) -> Result<()> {
+            
+            unsafe {
+                self.device.device_wait_idle()?
+            };
+
+            self.recreate = RecreateWrapper::new(self.device.clone(), &self.instance, window, &self.vertex_buffer)?;
+            
+            Ok(())
+        }
     }
 
     impl Drop for VulkanHandler {
         fn drop(&mut self) {
             unsafe {
                 self.device.logical_device.device_wait_idle().unwrap();
+            }
+        }
+    }
+
+    struct RecreateWrapper {
+        command: CommandWrapper,
+        framebuffers: Vec<vk::Framebuffer>,
+        pipeline: PipelineWrapper,
+        swapchain: SwapchainWrapper,
+        device: Arc<DeviceWrapper>,
+    }
+
+    impl RecreateWrapper {
+        fn new(device: Arc<DeviceWrapper>, instance: &InstanceWrapper, window: &Window, vertex_buffer: &VertexBuffer) -> Result<Self> {
+            let swapchain = SwapchainWrapper::new(instance, device.clone(), window)?;
+            let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format)?;
+            let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass)?;
+            let mut command = CommandWrapper::new(&instance, device.clone(), &framebuffers, &swapchain, &pipeline, vertex_buffer)?;
+            command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
+
+            Ok(Self { command, framebuffers, pipeline, swapchain, device })
+        }
+
+        fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass) -> Result<Vec<vk::Framebuffer>> {
+            let framebuffers = 
+                swapchain.swapchain_image_views
+                .iter()
+                .map(|i| {
+                    let attachments = &[*i];
+                    let create_info = vk::FramebufferCreateInfo::builder()
+                        .render_pass(*render_pass)
+                        .attachments(attachments)
+                        .width(swapchain.swapchain_extent.width)
+                        .height(swapchain.swapchain_extent.height)
+                        .layers(1);
+
+                    unsafe {
+                        logical_device.create_framebuffer(&create_info, None)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(framebuffers)
+        }
+    }
+
+    impl Drop for RecreateWrapper {
+        fn drop(&mut self) {
+            unsafe {
+                self.framebuffers
+                    .iter()
+                    .for_each(|f| self.device.destroy_framebuffer(*f, None));
             }
         }
     }
@@ -403,10 +477,6 @@ mod vulkan {
     struct DeviceWrapper {
         graphics_queue: vk::Queue,
         present_queue: vk::Queue,
-        command: CommandWrapper,
-        framebuffers: Vec<vk::Framebuffer>,
-        pipeline: PipelineWrapper,
-        swapchain: SwapchainWrapper, // Requires 'logical_device'
         physical_device: vk::PhysicalDevice,
         logical_device: Device,
     }
@@ -422,11 +492,8 @@ mod vulkan {
                     } else {
                         info!("Selected physical device (`{}`)", properties.device_name);
                         let (logical_device, graphics_queue, present_queue) = DeviceWrapper::create_logical_device(instance, physical_device)?;
-                        let swapchain = SwapchainWrapper::new(instance, physical_device, &logical_device, window)?;
-                        let pipeline = PipelineWrapper::new(&logical_device, swapchain.swapchain_extent, swapchain.swapchain_format)?;
-                        let framebuffers = DeviceWrapper::create_framebuffers(&logical_device, &swapchain, &pipeline.render_pass)?;
-                        let command = CommandWrapper::new(&instance, physical_device, &logical_device, &framebuffers, &swapchain, &pipeline)?;
-                        return Ok(Self { physical_device, logical_device, graphics_queue, present_queue, swapchain, pipeline, framebuffers, command });
+                        
+                        return Ok(Self { physical_device, logical_device, graphics_queue, present_queue});
                     }
                 }
             }
@@ -547,75 +614,47 @@ mod vulkan {
                 Err(anyhow!(SuitabilityError("Missing required device extensions.")))
             }
         }
-    
-        fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &RenderPassWeapper) -> Result<Vec<vk::Framebuffer>> {
-            let framebuffers = 
-                swapchain.swapchain_image_views
-                .iter()
-                .map(|i| {
-                    let attachments = &[*i];
-                    let create_info = vk::FramebufferCreateInfo::builder()
-                        .render_pass(render_pass.render_pass)
-                        .attachments(attachments)
-                        .width(swapchain.swapchain_extent.width)
-                        .height(swapchain.swapchain_extent.height)
-                        .layers(1);
 
-                    unsafe {
-                        logical_device.create_framebuffer(&create_info, None)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            Ok(framebuffers)
-        }
-
-        fn recreate_swapchain(&mut self, instance: &InstanceWrapper, window: &Window) -> Result<()> {
+        fn get_memory_type_index(physical_device: vk::PhysicalDevice, instance: &InstanceWrapper, properties: vk::MemoryPropertyFlags, requirements: vk::MemoryRequirements) -> Result<u32> {
             
-            unsafe {
-                self.logical_device.device_wait_idle()?
+            // Two arrays: memory_types and memory_heaps
+            let memory = unsafe {
+                instance.instance.get_physical_device_memory_properties(physical_device)
             };
-            self.destroy_swapchain();
 
-
-            self.swapchain = SwapchainWrapper::new(instance, self.physical_device, &self.logical_device, window)?;
-            self.pipeline = PipelineWrapper::new(&self.logical_device, self.swapchain.swapchain_extent, self.swapchain.swapchain_format)?;
-            self.framebuffers = DeviceWrapper::create_framebuffers(&self.logical_device, &self.swapchain, &self.pipeline.render_pass)?;
-            self.command = CommandWrapper::new(&instance, self.physical_device, &self.logical_device, &self.framebuffers, &self.swapchain, &self.pipeline)?;
-            self.command.images_in_flight.resize(self.swapchain.swapchain_images.len(), vk::Fence::null());
-            Ok(())
-        }
-
-        fn destroy_swapchain(&mut self) {
-            unsafe {
-                self.framebuffers
-                    .drain(..)
-                    .for_each(|f| self.logical_device.destroy_framebuffer(f, None));
-            }
-            self.swapchain.destroy(&self.logical_device);
-            self.pipeline.destroy(&self.logical_device);
-            
-            self.command.destroy(&self.logical_device);
-
+            // Get a memory space which matches properties and requirements provided
+            (0..memory.memory_type_count)
+                .find(|i| {
+                    let suitable = requirements.memory_type_bits & (1 << i) != 0;
+                    let memory_type = memory.memory_types[*i as usize];
+                    suitable && memory_type.property_flags.contains(properties)
+                })
+                .ok_or_else(|| anyhow!("Failed to find suitable memory type"))
         }
         
     }
 
     impl Drop for DeviceWrapper {
         fn drop(&mut self) {
-            
-            self.command.destroy(&self.logical_device);
-            self.pipeline.destroy(&self.logical_device);
-            self.swapchain.destroy(&self.logical_device);
-
             unsafe {
                 
-                self.framebuffers
-                    .iter()
-                    .for_each(|f| self.logical_device.destroy_framebuffer(*f, None));
-
+                
                 self.logical_device.destroy_device(None);
             }
+        }
+    }
+
+    impl Deref for DeviceWrapper {
+        type Target = Device;
+
+        fn deref(&self) -> &Self::Target {
+            &self.logical_device
+        }
+    }
+
+    impl DerefMut for DeviceWrapper {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.logical_device
         }
     }
 
@@ -731,12 +770,13 @@ mod vulkan {
         swapchain: vk::SwapchainKHR,
         swapchain_images: Vec<vk::Image>,
         swapchain_image_views: Vec<vk::ImageView>,
+        device: Arc<DeviceWrapper>
     }
 
     impl SwapchainWrapper {
-        fn new(instance: &InstanceWrapper, physical_device: vk::PhysicalDevice, logical_device: &Device, window: &Window) -> Result<Self> {
+        fn new(instance: &InstanceWrapper, device: Arc<DeviceWrapper>, window: &Window) -> Result<Self> {
 
-            let physical_device = physical_device;
+            let physical_device = device.physical_device;
 
             let support = SwapchainSupport::new(&instance, physical_device)?;
             let surface_format = SwapchainSupport::get_swapchain_surface_format(&support.formats);
@@ -787,17 +827,17 @@ mod vulkan {
                     .old_swapchain(vk::SwapchainKHR::null());
 
                 unsafe {
-                        logical_device.create_swapchain_khr(&info, None)?
+                        device.create_swapchain_khr(&info, None)?
                 }
             }; 
 
             let swapchain_images = unsafe {
-                logical_device.get_swapchain_images_khr(swapchain)?
+                device.get_swapchain_images_khr(swapchain)?
             };
 
-            let swapchain_image_views = SwapchainWrapper::create_swapchain_image_views(surface_format.format, &swapchain_images, logical_device)?;
+            let swapchain_image_views = SwapchainWrapper::create_swapchain_image_views(surface_format.format, &swapchain_images, &**device)?;
 
-            Ok(Self { swapchain_format: surface_format.format, swapchain_extent, swapchain, swapchain_images, swapchain_image_views })
+            Ok(Self { swapchain_format: surface_format.format, swapchain_extent, swapchain, swapchain_images, swapchain_image_views, device })
         }
 
         fn create_swapchain_image_views(swapchain_format: vk::Format, swapchain_images: &Vec<Image>,logical_device: &Device) -> Result<Vec<ImageView>> {
@@ -837,89 +877,111 @@ mod vulkan {
             Ok(image_view)
 
         }
+    }
 
-        fn destroy(&mut self, logical_device: &Device) {
+    impl Drop for SwapchainWrapper {
+        fn drop(&mut self) {
             unsafe {
                 self.swapchain_image_views
                     .iter()
-                    .for_each(|v| logical_device.destroy_image_view(*v, None));
+                    .for_each(|v| self.device.destroy_image_view(*v, None));
 
-                logical_device.destroy_swapchain_khr(self.swapchain, None);
+                self.device.destroy_swapchain_khr(self.swapchain, None);
             }
         }
     }
 
     struct PipelineWrapper {
         pipeline_layout: vk::PipelineLayout,
-        render_pass: RenderPassWeapper,
+        render_pass: vk::RenderPass,
         pipeline: vk::Pipeline,
+        device: Arc<DeviceWrapper>
     }
 
     impl PipelineWrapper {
-        fn new(logical_device: &Device, swapchain_extent: vk::Extent2D, swapchain_format: vk::Format) -> Result<Self> {
+        fn new(device: Arc<DeviceWrapper>, swapchain_extent: vk::Extent2D, swapchain_format: vk::Format) -> Result<Self> {
             let vert = include_bytes!("../shaders/vert.spv");
             let frag = include_bytes!("../shaders/frag.spv");
+
+            let logical_device = &**device;
 
             let vert_shader_module = PipelineWrapper::create_shader_module(logical_device, &vert[..])?;
             let frag_shader_module = PipelineWrapper::create_shader_module(logical_device, &frag[..])?;
 
-            let vert_stage = vk::PipelineShaderStageCreateInfo::builder()
+            let vert_stage = {vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(vert_shader_module)
-                .name(b"main\0");
+                .name(b"main\0")
+            };
 
-            let frag_stage = vk::PipelineShaderStageCreateInfo::builder()
+            let frag_stage = {vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag_shader_module)
-                .name(b"main\0");
+                .name(b"main\0")
+            };
 
-            let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
+            let binding_descriptions = &[Vertex::binding_description()];
+            let attribute_descriptions = Vertex::attribute_descriptions();
 
-            let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+            let vertex_input_state = {vk::PipelineVertexInputStateCreateInfo::builder()
+                .vertex_binding_descriptions(binding_descriptions)
+                .vertex_attribute_descriptions(&attribute_descriptions)
+            };
+
+
+            let input_assembly_state = {vk::PipelineInputAssemblyStateCreateInfo::builder()
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-                .primitive_restart_enable(false);
+                .primitive_restart_enable(false)
+            };
 
-            let viewport = vk::Viewport::builder()
+            let viewport = {vk::Viewport::builder()
                 .x(0.0)
                 .y(0.0)
                 .width(swapchain_extent.width as f32)
                 .height(swapchain_extent.height as f32)
                 .min_depth(0.0)
-                .max_depth(1.0);
+                .max_depth(1.0)
+            };
 
-            let scissor = vk::Rect2D::builder()
+            let scissor = {vk::Rect2D::builder()
                 .offset(vk::Offset2D {x: 0, y: 0})
-                .extent(swapchain_extent);
+                .extent(swapchain_extent)
+            };
 
             let viewports = &[viewport];
             let scissors = &[scissor];
-            let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            let viewport_state = {vk::PipelineViewportStateCreateInfo::builder()
                 .viewports(viewports)
-                .scissors(scissors);
+                .scissors(scissors)
+            };
 
-            let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+            let rasterization_state = {vk::PipelineRasterizationStateCreateInfo::builder()
                 .depth_clamp_enable(false)
                 .rasterizer_discard_enable(false)
                 .polygon_mode(vk::PolygonMode::FILL)
                 .line_width(1.0)
                 .cull_mode(vk::CullModeFlags::BACK)
                 .front_face(vk::FrontFace::CLOCKWISE)
-                .depth_bias_enable(false);
+                .depth_bias_enable(false)
+            };
                 
-            let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+            let multisample_state = {vk::PipelineMultisampleStateCreateInfo::builder()
                 .sample_shading_enable(false)
-                .rasterization_samples(vk::SampleCountFlags::_1);
+                .rasterization_samples(vk::SampleCountFlags::_1)
+            };
             
-            let attachment = vk::PipelineColorBlendAttachmentState::builder()
+            let attachment = {vk::PipelineColorBlendAttachmentState::builder()
                 .color_write_mask(vk::ColorComponentFlags::all())
-                .blend_enable(false);
+                .blend_enable(false)
+            };
 
             let attachments = &[attachment];
-            let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+            let color_blend_state = {vk::PipelineColorBlendStateCreateInfo::builder()
                 .logic_op_enable(false)
                 .logic_op(vk::LogicOp::COPY)
                 .attachments(attachments)
-                .blend_constants([0.0, 0.0, 0.0, 0.0]);
+                .blend_constants([0.0, 0.0, 0.0, 0.0])
+            };
             
             let pipeline_layout ={
                 let layout_info = vk::PipelineLayoutCreateInfo::builder();
@@ -928,66 +990,7 @@ mod vulkan {
                 }
             };
 
-            let render_pass = RenderPassWeapper::new(swapchain_format, logical_device)?;
-
-            let stages = &[vert_stage, frag_stage];
-            let info = vk::GraphicsPipelineCreateInfo::builder()
-                .stages(stages)
-                .vertex_input_state(&vertex_input_state)
-                .input_assembly_state(&input_assembly_state)
-                .viewport_state(&viewport_state)
-                .rasterization_state(&rasterization_state)
-                .multisample_state(&multisample_state)
-                .color_blend_state(&color_blend_state)
-                .layout(pipeline_layout)
-                .render_pass(render_pass.render_pass)
-                .subpass(0);
-
-            let pipeline = unsafe {
-                logical_device.create_graphics_pipelines(
-                    vk::PipelineCache::null(), &[info], None)?.0[0]
-            };
-
-            // Clean up shader_modules at end
-            unsafe {
-                logical_device.destroy_shader_module(vert_shader_module, None);
-                logical_device.destroy_shader_module(frag_shader_module, None);
-            }
-
-            Ok(Self { pipeline_layout, render_pass, pipeline})
-        }
-
-        fn create_shader_module(logical_device: &Device, bytecode: &[u8]) -> Result<vk::ShaderModule> {
-            use vulkanalia::bytecode::Bytecode;
-
-            let bytecode = Bytecode::new(bytecode).context("Shader provided has incorrect bytecode")?;
-
-            let info = vk::ShaderModuleCreateInfo::builder()
-                .code_size(bytecode.code_size())
-                .code(bytecode.code());
-
-            let shader_module = unsafe {
-                logical_device.create_shader_module(&info, None)?
-            };
-            
-            Ok(shader_module)
-        }
-    
-        fn destroy(&mut self, logical_device: &Device) {
-            self.render_pass.destroy(logical_device);
-            unsafe {
-                logical_device.destroy_pipeline_layout(self.pipeline_layout, None);
-                logical_device.destroy_pipeline(self.pipeline, None);
-            }
-        }
-    }
-
-    struct RenderPassWeapper {
-        render_pass: vk::RenderPass,
-    }
-
-    impl RenderPassWeapper {
-        fn new(swapchain_format: vk::Format, logical_device: &Device) -> Result<Self> {
+            // let render_pass = RenderPassWeapper::new(swapchain_format, logical_device)?;
 
             let render_pass = unsafe {
                 // Attachments
@@ -1033,12 +1036,58 @@ mod vulkan {
                 logical_device.create_render_pass(&info, None)?  
             };
 
-            Ok(Self { render_pass })
-        }
- 
-        fn destroy(&mut self, logical_device: &Device) {
+            let stages = &[vert_stage, frag_stage];
+            let info = {vk::GraphicsPipelineCreateInfo::builder()
+                .stages(stages)
+                .vertex_input_state(&vertex_input_state)
+                .input_assembly_state(&input_assembly_state)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization_state)
+                .multisample_state(&multisample_state)
+                .color_blend_state(&color_blend_state)
+                .layout(pipeline_layout)
+                .render_pass(render_pass)
+                .subpass(0)
+            };
+
+            let pipeline = unsafe {
+                logical_device.create_graphics_pipelines(
+                    vk::PipelineCache::null(), &[info], None)?.0[0]
+            };
+
+            // Clean up shader_modules at end
             unsafe {
-                logical_device.destroy_render_pass(self.render_pass, None);
+                logical_device.destroy_shader_module(vert_shader_module, None);
+                logical_device.destroy_shader_module(frag_shader_module, None);
+            }
+
+            Ok(Self { pipeline_layout, render_pass, pipeline, device})
+        }
+
+        fn create_shader_module(logical_device: &Device, bytecode: &[u8]) -> Result<vk::ShaderModule> {
+            use vulkanalia::bytecode::Bytecode;
+
+            let bytecode = Bytecode::new(bytecode).context("Shader provided has incorrect bytecode")?;
+
+            let info = vk::ShaderModuleCreateInfo::builder()
+                .code_size(bytecode.code_size())
+                .code(bytecode.code());
+
+            let shader_module = unsafe {
+                logical_device.create_shader_module(&info, None)?
+            };
+            
+            Ok(shader_module)
+        }
+    }
+
+    impl Drop for PipelineWrapper {
+        fn drop(&mut self) {
+            // self.render_pass.destroy(logical_device);
+            unsafe {
+                self.device.destroy_render_pass(self.render_pass, None);
+                self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+                self.device.destroy_pipeline(self.pipeline, None);
             }
         }
     }
@@ -1052,12 +1101,19 @@ mod vulkan {
         // Fences to control CPU syncronization
         in_flight_fences: Vec<vk::Fence>,
         images_in_flight: Vec<vk::Fence>,
+        device: Arc<DeviceWrapper>,
     }
 
     impl CommandWrapper {
-        fn new(instance: &InstanceWrapper, physical_device: vk::PhysicalDevice, logical_device: &Device, framebuffers: &Vec<vk::Framebuffer>, swapchain: &SwapchainWrapper, pipeline: &PipelineWrapper) -> Result<Self> {
-            let command_pool = CommandWrapper::create_command_pool(instance, physical_device, logical_device)?;
-            let command_buffers  =CommandWrapper::create_command_buffers(logical_device, command_pool, framebuffers, swapchain, pipeline)?;
+        fn new(instance: &InstanceWrapper, 
+               device: Arc<DeviceWrapper>,
+               framebuffers: &Vec<vk::Framebuffer>, 
+               swapchain: &SwapchainWrapper, 
+               pipeline: &PipelineWrapper, 
+               vertex_buffer: &VertexBuffer,
+        ) -> Result<Self> {
+            let command_pool = CommandWrapper::create_command_pool(instance, &*device)?;
+            let command_buffers  = CommandWrapper::create_command_buffers(&*device, command_pool, framebuffers, swapchain, pipeline, vertex_buffer)?;
 
             let (image_available_semaphores, render_finished_semaphores, in_flight_fences) = unsafe {
                 let semaphore_info = vk::SemaphoreCreateInfo::builder();
@@ -1071,12 +1127,12 @@ mod vulkan {
 
                 for _ in 0..MAX_FRAMES_IN_FLIGHT {
                     image_available_semaphores
-                        .push(logical_device.create_semaphore(&semaphore_info, None)?);
+                        .push(device.create_semaphore(&semaphore_info, None)?);
                     render_finished_semaphores
-                        .push(logical_device.create_semaphore(&semaphore_info, None)?);
+                        .push(device.create_semaphore(&semaphore_info, None)?);
                 
                     in_flight_fences
-                        .push(logical_device.create_fence(&fence_info, None)?);
+                        .push(device.create_fence(&fence_info, None)?);
                 }
 
                 (image_available_semaphores, render_finished_semaphores, in_flight_fences)
@@ -1087,31 +1143,31 @@ mod vulkan {
                 .map(|_| vk::Fence::null())
                 .collect();
 
-            Ok(Self { command_pool, command_buffers, image_available_semaphores, render_finished_semaphores, in_flight_fences, images_in_flight })
+            Ok(Self { command_pool, command_buffers, image_available_semaphores, render_finished_semaphores, in_flight_fences, images_in_flight, device })
         }
 
-        fn create_command_pool(instance: &InstanceWrapper, physical_device: vk::PhysicalDevice, logical_device: &Device) -> Result<vk::CommandPool> {
-            let indices = QueueFamilyIndices::new(instance, physical_device)?;
+        fn create_command_pool(instance: &InstanceWrapper, device: &DeviceWrapper) -> Result<vk::CommandPool> {
+            let indices = QueueFamilyIndices::new(instance, device.physical_device)?;
 
             let info = vk::CommandPoolCreateInfo::builder()
                 .flags(vk::CommandPoolCreateFlags::empty())
                 .queue_family_index(indices.graphics);
 
             let command_pool = unsafe {
-                logical_device.create_command_pool(&info, None)?
+                device.create_command_pool(&info, None)?
             };
 
             Ok(command_pool)
         }
     
-        fn create_command_buffers(logical_device: &Device, command_pool: vk::CommandPool, framebuffers: &Vec<vk::Framebuffer>, swapchain: &SwapchainWrapper, pipeline: &PipelineWrapper) -> Result<Vec<vk::CommandBuffer>> {
+        fn create_command_buffers(device: &DeviceWrapper, command_pool: vk::CommandPool, framebuffers: &Vec<vk::Framebuffer>, swapchain: &SwapchainWrapper, pipeline: &PipelineWrapper, vertex_buffer: &VertexBuffer) -> Result<Vec<vk::CommandBuffer>> {
             let allocate_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(framebuffers.len() as u32);
 
             let command_buffers = unsafe {
-                logical_device.allocate_command_buffers(&allocate_info) ?
+                device.allocate_command_buffers(&allocate_info) ?
             };
 
             for (i, command_buffer) in command_buffers.iter().enumerate() {
@@ -1122,7 +1178,7 @@ mod vulkan {
                     .inheritance_info(&inheritance);
 
                 unsafe {
-                    logical_device.begin_command_buffer(*command_buffer, &info)?
+                    device.begin_command_buffer(*command_buffer, &info)?
                 };
 
                 let render_area = vk::Rect2D::builder()
@@ -1137,17 +1193,18 @@ mod vulkan {
 
                 let clear_values = &[color_clear_value];
                 let info = vk::RenderPassBeginInfo::builder()
-                    .render_pass(pipeline.render_pass.render_pass)
+                    .render_pass(pipeline.render_pass)
                     .framebuffer(framebuffers[i])
                     .render_area(render_area)
                     .clear_values(clear_values);
 
                 unsafe {
-                    logical_device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
-                    logical_device.cmd_bind_pipeline(*command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
-                    logical_device.cmd_draw(*command_buffer, 3, 1, 0, 0);
-                    logical_device.cmd_end_render_pass(*command_buffer);
-                    logical_device.end_command_buffer(*command_buffer)?;
+                    device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
+                    device.cmd_bind_pipeline(*command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
+                    device.cmd_bind_vertex_buffers(*command_buffer, 0, &[vertex_buffer.vertex_buffer.buffer], &[0]);
+                    device.cmd_draw(*command_buffer, VERTICES.len() as u32, 1, 0, 0);
+                    device.cmd_end_render_pass(*command_buffer);
+                    device.end_command_buffer(*command_buffer)?;
                 }
                 
             }
@@ -1155,24 +1212,165 @@ mod vulkan {
             Ok(command_buffers)
         }
 
-        fn destroy(&mut self, logical_device: &Device) {
-            
+    }
+
+    impl Drop for CommandWrapper {
+        fn drop(&mut self) {
             unsafe {
                 // Semaphores must match ones created
                 self.render_finished_semaphores
                     .drain(..)
-                    .for_each(|s| logical_device.destroy_semaphore(s, None));
+                    .for_each(|s| self.device.destroy_semaphore(s, None));
                 self.image_available_semaphores
                     .drain(..)
-                    .for_each(|s| logical_device.destroy_semaphore(s, None));
+                    .for_each(|s| self.device.destroy_semaphore(s, None));
                 
                 self.in_flight_fences
                     .drain(..)
-                    .for_each(|f| logical_device.destroy_fence(f, None));
+                    .for_each(|f| self.device.destroy_fence(f, None));
 
-                logical_device.destroy_command_pool(self.command_pool, None);
+                self.device.destroy_command_pool(self.command_pool, None);
             }
         }
     }
     
+    use std::mem::size_of;
+    use cgmath::{vec2, vec3};
+
+    type Vec2 = cgmath::Vector2<f32>;
+    type Vec3 = cgmath::Vector3<f32>;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
+    struct Vertex {
+        pos: Vec2,
+        color: Vec3,
+    }
+
+    impl Vertex {
+        const  fn new(pos: Vec2, color: Vec3) -> Self {
+            Self {pos, color}
+        }
+
+        fn binding_description() -> vk::VertexInputBindingDescription {
+            vk::VertexInputBindingDescription::builder()
+                .binding(0)
+                .stride(size_of::<Vertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX)
+                .build()
+        }
+
+        fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+            let pos = vk::VertexInputAttributeDescription::builder()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0)
+                .build();
+
+            let color = vk::VertexInputAttributeDescription::builder()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(size_of::<Vec2>() as u32)
+                .build();
+
+            [pos, color]
+        }
+    }
+
+    static VERTICES: [Vertex; 3] = [
+        Vertex::new(vec2(0.0, -0.5), vec3(1.0, 0.0, 0.0)),
+        Vertex::new(vec2(0.5, 0.5), vec3(0.0, 1.0, 0.0)),
+        Vertex::new(vec2(-0.5, 0.5), vec3(0.0, 0.0, 1.0)),
+    ];
+
+    // Buffers
+
+    use std::ptr::copy_nonoverlapping as memcpy;
+
+    struct Buffer {
+        buffer_info: BufferCreateInfoBuilder<'static>,
+        buffer_memory: vk::DeviceMemory,
+        buffer: vk::Buffer,
+        device: Arc<DeviceWrapper>,
+    }
+
+    impl Buffer {
+        fn new(instance: &InstanceWrapper,
+               device: Arc<DeviceWrapper>, 
+               properties: vk::MemoryPropertyFlags, 
+               usage: vk::BufferUsageFlags,
+            ) -> Result<Self> {
+            
+            let buffer_info = vk::BufferCreateInfo::builder()
+                .size((size_of::<Vertex>() * VERTICES.len()) as u64)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+            // Safety: memory concerns for sparse memory
+            let buffer = unsafe {
+                device.create_buffer(&buffer_info, None)?
+            };
+
+            let requirements = unsafe {
+                device.get_buffer_memory_requirements(buffer)  
+            };
+
+            let memory_info = vk::MemoryAllocateInfo::builder()
+                .allocation_size(requirements.size)
+                .memory_type_index(DeviceWrapper::get_memory_type_index(device.physical_device, instance, properties, requirements)?);
+
+            let buffer_memory = unsafe {
+                device.allocate_memory(&memory_info, None)?  
+            };
+
+            Ok(Self { buffer_memory, buffer, buffer_info, device })
+        }
+    }
+
+    impl Drop for Buffer {
+        fn drop(&mut self) {
+            unsafe {
+                self.device.destroy_buffer(self.buffer, None);
+                self.device.free_memory(self.buffer_memory, None)
+            } 
+        }
+    }
+
+    struct VertexBuffer {
+        vertex_buffer: Buffer
+    }
+
+    impl VertexBuffer {
+        fn new(instance: &InstanceWrapper,
+               device: Arc<DeviceWrapper>,
+        ) -> Result<Self> {
+
+            let vertex_buffer = Buffer::new(
+                instance, 
+                device.clone(),
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE, 
+                vk::BufferUsageFlags::VERTEX_BUFFER
+            )?;
+
+            let memory = unsafe {
+                device.map_memory(
+                    vertex_buffer.buffer_memory, 
+                    0, 
+                    vertex_buffer.buffer_info.size,
+                    vk::MemoryMapFlags::empty()
+                )
+            }?;
+
+            unsafe {
+                memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+                device.unmap_memory(vertex_buffer.buffer_memory);
+            };
+
+            Ok(Self { vertex_buffer })
+        }
+    }
+
 }
+

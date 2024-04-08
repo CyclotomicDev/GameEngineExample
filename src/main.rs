@@ -20,7 +20,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering::Relaxed}};
 use winit::dpi::LogicalSize;
 use winit::event_loop::{self, EventLoop};
 use winit::event::{Event, WindowEvent};
-use winit::window::{self, Window, WindowBuilder};
+use winit::window::{self, Fullscreen, Window, WindowBuilder};
 use anyhow::Result;
 use log::*;
 use std::any::Any;
@@ -315,6 +315,7 @@ impl WindowHandler {
         let window = Arc::new(WindowBuilder::new()
             .with_title(title)
             .with_inner_size(LogicalSize::new(width,height))
+            //.with_fullscreen(Some(Fullscreen::Borderless(None)))
             .build(&event_loop)?);
     
 
