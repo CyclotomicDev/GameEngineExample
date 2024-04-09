@@ -3,65 +3,87 @@ use control::*;
 use graphics::GraphicsHandler;
 use data::DataHandler;
 use control::ControlHandler;
-use layers::{AnyLayer, Layer};
-use state::StateHandler;
-use tokio::sync::mpsc::error::SendError;
-use winit::platform::pump_events::{PumpStatus, EventLoopExtPumpEvents};
-use std::error::Error;
-use std::future::Future;
-use std::ops::Deref;
-use std::pin::Pin;
-use std::task::Poll;
-use std::mem;
+use layers::AnyLayer;
+use winit::{
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::{Window, WindowBuilder},
+    platform::pump_events::{PumpStatus, EventLoopExtPumpEvents},
+};
 use std::time::Duration;
-use tokio::{task::JoinHandle, time::sleep, sync::mpsc, join};
-use tokio::sync::{Mutex, RwLock};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering::Relaxed}};
+use tokio::sync::Mutex;
+use std::sync::Arc;
 use winit::dpi::LogicalSize;
-use winit::event_loop::{self, EventLoop};
-use winit::event::{Event, WindowEvent};
-use winit::window::{self, Fullscreen, Window, WindowBuilder};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::*;
-use std::any::Any;
 
 //#[tokio::main(flavor = "current_thread")]
 #[tokio::main]
 async fn main() -> Result<()> {
     
-    simple_logging::log_to_file("test.log", LevelFilter::Info)?;
-
-
-    //let mut app = App::new();
-
-    /*
+    simple_logging::log_to_file("test.log", LevelFilter::Debug)?;
 
     let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
 
-    let mut graphics: Arc<Mutex<Option<Box<GraphicsHandler>>>> = Arc::new(Mutex::new(None));
-    let mut data: Arc<Mutex<Option<Box<DataHandler>>>> = Arc::new(Mutex::new(None));
-    //let mut data: Option<Data> = None;
-
-    //let mut current_state: Box<GameState> = Box::new(GameState::new());
-    let mut current_state: StateHandler = StateHandler::new();
-    let (state_tx, mut state_rx) = mpsc::channel::<InstructionBuffer>(1);
-    {state_tx.send(InstructionBuffer::default()).await};
-    */
-
-    let mut window_handler = WindowHandler::new("Project G03Alpha", (1200,800))?;
-
-    let graphics = Arc::new(Mutex::new(GraphicsHandler::new(&window_handler.window)?));
+    let mut graphics = GraphicsHandler::new(&window_handler.window)?;
     let data = Arc::new(Mutex::new(DataHandler::new()?));
     let mut control = ControlHandler::new();
 
-    let graphics_future = graphics_cycle(InstructionBuffer::default(), &window_handler.window, graphics.clone());
+    //let graphics_future = graphics_cycle(InstructionBuffer::default(), &window_handler.window, graphics.clone());
     let data_future = data_cycle(InstructionBuffer::default(), data.clone());
-    tokio::pin!(graphics_future);
+    // tokio::pin!(graphics_future);
     tokio::pin!(data_future);
 
     let mut buffer_collection = BufferColection::default(); 
+
+    'main: loop {
+        // Handle window events
+        let window = &window_handler.window;
+        let event_loop = &window_handler.event_loop;
+
+        let mut buffer = InstructionBuffer::default();
+        let timeout = Some(Duration::ZERO);
+        event_loop.set_control_flow(ControlFlow::Poll);
+        
+
+        let status = window_handler.event_loop.pump_events( timeout,  |event, elwt| {
+            match event {
+                Event::WindowEvent { 
+                    event: WindowEvent::CloseRequested,
+                    window_id,
+                } if window.id() == window_id => {
+                    info!("Window close requested");
+                    elwt.exit();
+                }
+                Event::AboutToWait => {
+                    // Continuous requests (rendering)
+                    graphics.render(window);
+                }
+                 Event::WindowEvent {
+                    event: WindowEvent::RedrawRequested, 
+                    ..
+                } => {
+                    // // Non-continuous requests 
+                },
+                _ => (),
+            }
+        });
+
+        if let PumpStatus::Exit(exit_code) = status {
+            info!("Main loop exited");
+            break 'main;
+        }
+
+        // Handle async
+        tokio::select! {
+            _ = &mut data_future => {
+                data_future.set(data_cycle(InstructionBuffer::default(), data.clone()))
+            }
+        }
+    }
     
 
+    /*
     'main: loop {
 
         handle_events(&mut window_handler.event_loop, &window_handler.window).await?
@@ -81,6 +103,8 @@ async fn main() -> Result<()> {
                 data_future.set(data_cycle(InstructionBuffer::default(), data.clone()))
             }
         }
+
+        */
 
 
 
@@ -274,7 +298,7 @@ async fn main() -> Result<()> {
         };
         */
     }
-    }
+    
 
     Ok(())
 
@@ -305,18 +329,18 @@ async fn data_cycle(mut instructions: InstructionBuffer, data: Arc<Mutex<DataHan
 /// Contains all information about window control
 struct WindowHandler {
     event_loop: EventLoop<()>,
-    window: Arc<Window>,
+    window: Window,
 }
 
 /// To do: hnadle errors
 impl WindowHandler {
     fn new(title: &str, (width, height): (u32,u32)) -> Result<Self>{
         let event_loop = EventLoop::new()?;
-        let window = Arc::new(WindowBuilder::new()
+        let window = WindowBuilder::new()
             .with_title(title)
             .with_inner_size(LogicalSize::new(width,height))
             //.with_fullscreen(Some(Fullscreen::Borderless(None)))
-            .build(&event_loop)?);
+            .build(&event_loop)?;
     
 
         info!("Window successfully created");

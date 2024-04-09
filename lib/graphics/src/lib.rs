@@ -1,8 +1,7 @@
 use anyhow::{Result,anyhow};
-use winit::window::{Window, WindowBuilder};
+use winit::window::Window;
 //use control::control::{InstructionBuffer,Instruction, Layer};
 use layers::Layer;
-use tokio::sync::Mutex;
 
 
 // Warning: minimized not handles properly, may need resructuring
