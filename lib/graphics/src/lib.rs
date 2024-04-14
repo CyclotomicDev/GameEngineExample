@@ -52,12 +52,16 @@ mod vulkan {
     use vulkanalia::loader::{LibloadingLoader, LIBRARY};
     use vulkanalia::{bytecode, window as vk_window};
     use vulkanalia::prelude::v1_0::*;
-    use vulkanalia::vk::{BufferCreateInfoBuilder, ExtDebugUtilsExtension, Image, ImageView, KhrSurfaceExtension, KhrSwapchainExtension, MemoryPropertyFlags, PipelineColorBlendAttachmentState};
+    use vulkanalia::vk::{Buffer, BufferCreateInfoBuilder, ExtDebugUtilsExtension, Image, ImageView, KhrSurfaceExtension, KhrSwapchainExtension, MemoryPropertyFlags, PipelineColorBlendAttachmentState};
+
+    use cgmath::{point3, Deg};
+    type Mat4 = cgmath::Matrix4<f32>;
 
     use std::collections::HashSet;
     use std::ffi::CStr;
     use std::os::raw::c_void;
     use std::ops::{Deref, DerefMut};
+    use std::time::Instant;
 
     const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
@@ -102,39 +106,42 @@ mod vulkan {
         vk::FALSE
     }
 
+
    // Note: drop executed in order first to last
     pub struct VulkanHandler {
-        recreate: RecreateWrapper, // Handles objects that may be recreated
+        recreate: Option<RecreateWrapper>, // Handles objects that may be recreated
+        index_buffer: IndexBuffer,
         vertex_buffer: VertexBuffer,
+        descriptor_set_layout: DescriptorSetLayoutWrapper,
+        command_pool: CommandPoolWrapper,
         device: Arc<DeviceWrapper>, // Destroyed after all other objects
         instance: InstanceWrapper, // Destroyed after device
         
         frame: usize,
         resized: bool,
+        start: Instant,
     }
 
     impl VulkanHandler {
         pub fn new(window: &Window) -> Result<Self> {
             let instance = InstanceWrapper::new(window)?;
             let device = Arc::new(DeviceWrapper::new(&instance, window)?);
-            let vertex_buffer = VertexBuffer::new(&instance, device.clone())?;
-            let recreate = RecreateWrapper::new(device.clone(), &instance, window, &vertex_buffer)?;
+            let command_pool = CommandPoolWrapper::new(&instance, device.clone())?;
+            let descriptor_set_layout = DescriptorSetLayoutWrapper::new(device.clone())?;
+            let vertex_buffer = VertexBuffer::new(&instance, device.clone(), &command_pool)?;
+            let index_buffer = IndexBuffer::new(&instance, device.clone(), &command_pool)?; 
+            let recreate = Some(RecreateWrapper::new(device.clone(), &instance, window, &vertex_buffer, &index_buffer, &command_pool, &descriptor_set_layout)?);
 
-            /*
-            let swapchain = SwapchainWrapper::new(&instance, device.clone() , window)?;
-            let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format)?;
-            let framebuffers = DeviceWrapper::create_framebuffers(&logical_device, &swapchain, &pipeline.render_pass)?;
-            let command = CommandWrapper::new(&instance, physical_device, &logical_device, &framebuffers, &swapchain, &pipeline, &vertex_buffer)?;
-            */
-            Ok(Self {instance, device, frame: 0, resized: false,vertex_buffer, recreate })
+            Ok(Self {instance, device, frame: 0, resized: false,vertex_buffer, index_buffer, recreate, command_pool, descriptor_set_layout, start: Instant::now() })
         }
 
         pub fn render(&mut self, window: &Window) -> Result<()> {
+            let recreate = self.recreate.as_mut().ok_or(anyhow!("Recreate missing"))?;
             let logical_device = &self.device.logical_device;
-            let image_available_semaphores = &self.recreate.command.image_available_semaphores;
-            let render_finsished_semaphores = &self.recreate.command.render_finished_semaphores;
-            let in_flight_fences = &self.recreate.command.in_flight_fences;
-            let images_in_flight = &mut self.recreate.command.images_in_flight;
+            let image_available_semaphores = &recreate.command.image_available_semaphores;
+            let render_finsished_semaphores = &recreate.command.render_finished_semaphores;
+            let in_flight_fences = &recreate.command.in_flight_fences;
+            let images_in_flight = &mut recreate.command.images_in_flight;
             let frame = self.frame;
 
             // Wait for other frames to be completed; safety: both device and in_flight_fences created
@@ -151,9 +158,9 @@ mod vulkan {
             
             let result = unsafe {
                 logical_device.acquire_next_image_khr(
-                    self.recreate.swapchain.swapchain, 
+                    recreate.swapchain.swapchain, 
                     u64::MAX, 
-                    self.recreate.command.image_available_semaphores[frame], 
+                    recreate.command.image_available_semaphores[frame], 
                     vk::Fence::null()
                 )
             };
@@ -171,21 +178,9 @@ mod vulkan {
             };
 
 
-            let swapchain = self.recreate.swapchain.swapchain;
+            let swapchain = recreate.swapchain.swapchain;
 
-            
-            /*
-            let image_index = unsafe {
-                logical_device
-                    .acquire_next_image_khr(
-                        swapchain, 
-                        u64::MAX, 
-                        image_available_semaphores[self.frame], 
-                        vk::Fence::null(),
-                    )?
-                    .0 as usize
-            };
-            */
+
 
             if !images_in_flight[image_index].is_null() {
                 unsafe {
@@ -199,11 +194,13 @@ mod vulkan {
 
             images_in_flight[image_index] = in_flight_fences[frame];
 
+            VulkanHandler::update_uniform_buffer(self.start.elapsed().as_secs_f32(), self.device.clone(), &recreate.uniform_buffers.buffers[image_index], &recreate.swapchain)?;
+
             // 2. Execute command buffer with image as attachment in the framebuffer
 
             let wait_semaphores = &[image_available_semaphores[self.frame]];
             let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let command_buffers = &[self.recreate.command.command_buffers[image_index as usize]];
+            let command_buffers = &[recreate.command.command_buffers[image_index as usize]];
             let signal_semaphores = &[render_finsished_semaphores[self.frame]];
             let submit_info = vk::SubmitInfo::builder()
                 .wait_semaphores(wait_semaphores)
@@ -249,16 +246,64 @@ mod vulkan {
         pub fn set_resized(&mut self) {
             self.resized = true;
         }
-        
 
         fn recreate_swapchain(&mut self, window: &Window) -> Result<()> {
             
+            debug!("Recreate swapchain");
+
             unsafe {
                 self.device.device_wait_idle()?
             };
 
-            self.recreate = RecreateWrapper::new(self.device.clone(), &self.instance, window, &self.vertex_buffer)?;
+            self.recreate = None;
+            self.recreate = Some(RecreateWrapper::new(self.device.clone(), &self.instance, window, &self.vertex_buffer, &self.index_buffer, &self.command_pool, &self.descriptor_set_layout)?);
             
+            
+
+            Ok(())
+        }
+    
+        fn update_uniform_buffer(time: f32, device: Arc<DeviceWrapper>, buffer: &BufferWrapper, swapchain: &SwapchainWrapper) -> Result<()> {
+
+            let model = Mat4::from_axis_angle(
+                vec3(0.0, 0.0, 1.0), 
+                Deg(90.0) * time
+            );
+
+            let view = Mat4::look_at_rh(
+                point3(2.0, 2.0, 2.0), 
+                point3(0.0, 0.0, 0.0), 
+                vec3(0.0, 0.0, 1.0),
+            );
+
+            let swapchain_extent = swapchain.swapchain_extent;
+
+            let mut proj = cgmath::perspective(
+                Deg(45.0), 
+                swapchain_extent.width as f32 / swapchain_extent.height as f32, 
+                0.1, 
+                10.0,
+            );
+
+            proj[1][1] *= -1.0;
+
+            let ubo = UniformBufferObject { model, view, proj };
+
+            let memory = unsafe {
+                device.map_memory(
+                    buffer.buffer_memory, 
+                    0, 
+                    size_of::<UniformBufferObject>() as u64, 
+                    vk::MemoryMapFlags::empty()
+                )?
+            };
+
+            unsafe {
+                memcpy(&ubo, memory.cast(), 1);
+
+                device.unmap_memory(buffer.buffer_memory);
+            }
+
             Ok(())
         }
     }
@@ -274,20 +319,33 @@ mod vulkan {
     struct RecreateWrapper {
         command: CommandWrapper,
         framebuffers: Vec<vk::Framebuffer>,
+        uniform_buffers: UniformBuffers,
+        descriptor_pool: DescriptorPoolWrapper,
         pipeline: PipelineWrapper,
         swapchain: SwapchainWrapper,
         device: Arc<DeviceWrapper>,
     }
 
     impl RecreateWrapper {
-        fn new(device: Arc<DeviceWrapper>, instance: &InstanceWrapper, window: &Window, vertex_buffer: &VertexBuffer) -> Result<Self> {
+        fn new(
+            device: Arc<DeviceWrapper>, 
+            instance: &InstanceWrapper, 
+            window: &Window, 
+            vertex_buffer: &VertexBuffer,
+            index_buffer: &IndexBuffer,
+            command_pool: &CommandPoolWrapper,
+            descriptor_set_layout: &DescriptorSetLayoutWrapper,
+        ) -> Result<Self> {
             let swapchain = SwapchainWrapper::new(instance, device.clone(), window)?;
-            let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format)?;
+            let uniform_buffers = UniformBuffers::new(instance, device.clone(), &swapchain)?;
+            let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format, descriptor_set_layout)?;
+            let descriptor_pool = DescriptorPoolWrapper::new(device.clone(), &swapchain)?;
+            let descriptor_sets = DescriptorSetsWrapper::new(device.clone(), descriptor_set_layout, &descriptor_pool, &swapchain, &uniform_buffers)?;
             let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass)?;
-            let mut command = CommandWrapper::new(&instance, device.clone(), &framebuffers, &swapchain, &pipeline, vertex_buffer)?;
+            let mut command = CommandWrapper::new(&instance, device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, vertex_buffer, index_buffer, &descriptor_sets)?;
             command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
 
-            Ok(Self { command, framebuffers, pipeline, swapchain, device })
+            Ok(Self { command, framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool })
         }
 
         fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass) -> Result<Vec<vk::Framebuffer>> {
@@ -310,6 +368,21 @@ mod vulkan {
                 .collect::<Result<Vec<_>, _>>()?;
 
             Ok(framebuffers)
+        }
+
+        fn drop_then_replace(
+            self,
+            device: Arc<DeviceWrapper>, 
+            instance: &InstanceWrapper, 
+            window: &Window, 
+            vertex_buffer: &VertexBuffer,
+            index_buffer: &IndexBuffer,
+            command_pool: &CommandPoolWrapper,
+            descriptor_set_layout: &DescriptorSetLayoutWrapper,
+        ) -> Result<Self> {
+            drop(self);
+
+            RecreateWrapper::new(device, instance, window, vertex_buffer, index_buffer, command_pool, descriptor_set_layout)
         }
     }
 
@@ -615,11 +688,11 @@ mod vulkan {
             }
         }
 
-        fn get_memory_type_index(physical_device: vk::PhysicalDevice, instance: &InstanceWrapper, properties: vk::MemoryPropertyFlags, requirements: vk::MemoryRequirements) -> Result<u32> {
+        fn get_memory_type_index(&self, instance: &InstanceWrapper, properties: vk::MemoryPropertyFlags, requirements: vk::MemoryRequirements) -> Result<u32> {
             
             // Two arrays: memory_types and memory_heaps
             let memory = unsafe {
-                instance.instance.get_physical_device_memory_properties(physical_device)
+                instance.instance.get_physical_device_memory_properties(self.physical_device)
             };
 
             // Get a memory space which matches properties and requirements provided
@@ -657,44 +730,6 @@ mod vulkan {
             &mut self.logical_device
         }
     }
-
-    struct QueueFamilyIndices {
-        graphics: u32,
-        present: u32,
-    }
-
-    impl QueueFamilyIndices {
-        fn new(instance: &InstanceWrapper, physical_device: vk::PhysicalDevice) -> Result<Self> {
-            let InstanceWrapper { entry: _, messenger: _, surface, instance } = instance;
-            
-            let properties = unsafe {
-                instance
-                    .get_physical_device_queue_family_properties(physical_device)
-            };
-
-            let graphics = properties
-                .iter()
-                .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                .map(|i| i as u32);
-
-            let mut present = None;
-            for (index, properties) in properties.iter().enumerate() {
-                unsafe {
-                    if instance.get_physical_device_surface_support_khr(physical_device, index as u32, *surface)? {
-                        present = Some(index as u32);
-                        break;
-                    }
-                }
-            }
-
-            if let (Some(graphics), Some(present)) = (graphics, present) {
-                Ok(Self { graphics, present })
-            } else {
-                Err(anyhow!(SuitabilityError("Missing required queue families")))
-            }
-        }
-    }
-
     #[derive(Clone, Debug)]
     struct SwapchainSupport {
         capabilities: vk::SurfaceCapabilitiesKHR,
@@ -891,6 +926,126 @@ mod vulkan {
         }
     }
 
+    struct DescriptorSetLayoutWrapper {
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        device: Arc<DeviceWrapper>,
+    }
+
+    impl DescriptorSetLayoutWrapper {
+        fn new(
+            device: Arc<DeviceWrapper>,
+        ) -> Result<Self> {
+            let ubo_binding = vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+            let bindings = &[ubo_binding];
+            let info = vk::DescriptorSetLayoutCreateInfo::builder()
+                .bindings(bindings);
+
+            let descriptor_set_layout = unsafe {
+                device.create_descriptor_set_layout(&info, None)?
+            };
+
+            Ok(Self { descriptor_set_layout, device })
+
+        }
+    }
+
+    impl Drop for DescriptorSetLayoutWrapper {
+        fn drop(&mut self) {
+            unsafe {
+                self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            }
+        }
+    }
+
+    impl Deref for DescriptorSetLayoutWrapper {
+        type Target = vk::DescriptorSetLayout;
+
+        fn deref(&self) -> &Self::Target {
+            &self.descriptor_set_layout
+        }
+    }
+
+    impl DerefMut for DescriptorSetLayoutWrapper {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.descriptor_set_layout
+        }
+    }
+
+    struct DescriptorPoolWrapper {
+        descriptor_pool: vk::DescriptorPool,
+        device: Arc<DeviceWrapper>,
+    }
+
+    impl DescriptorPoolWrapper {
+        fn new(device: Arc<DeviceWrapper>, swapchain: &SwapchainWrapper) -> Result<Self> {
+            let ubo_size = vk::DescriptorPoolSize::builder()
+                .type_(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(swapchain.swapchain_images.len() as u32);
+
+            let pool_sizes = &[ubo_size];
+            let info = vk::DescriptorPoolCreateInfo::builder()
+                .pool_sizes(pool_sizes)
+                .max_sets(swapchain.swapchain_images.len() as u32);
+
+            let descriptor_pool = unsafe {
+                device.create_descriptor_pool(&info, None)? 
+            };
+
+            Ok(Self { descriptor_pool, device })
+        }
+    }
+
+    impl Drop for DescriptorPoolWrapper {
+        fn drop(&mut self) {
+            unsafe {
+                self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            }
+        }
+    }
+
+    struct DescriptorSetsWrapper {
+        descriptor_sets: Vec<vk::DescriptorSet>,
+    }
+
+    impl DescriptorSetsWrapper {
+        fn new(device: Arc<DeviceWrapper>, descriptor_set_layout: &DescriptorSetLayoutWrapper, descriptor_pool: &DescriptorPoolWrapper,swapchain: &SwapchainWrapper, uniform_buffers: &UniformBuffers) -> Result<Self> {
+            let layouts = vec![descriptor_set_layout.descriptor_set_layout; swapchain.swapchain_images.len()];
+            let info = vk::DescriptorSetAllocateInfo::builder()
+                .descriptor_pool(descriptor_pool.descriptor_pool)
+                .set_layouts(&layouts);
+
+            let descriptor_sets = unsafe {
+                device.allocate_descriptor_sets(&info)?
+            };
+
+            for i in 0..swapchain.swapchain_images.len() {
+                let info = vk::DescriptorBufferInfo::builder()
+                    .buffer(uniform_buffers.buffers[i].buffer)
+                    .offset(0)
+                    .range(size_of::<UniformBufferObject>() as u64);
+
+                    let buffer_info = &[info];
+                    let ubo_write = vk::WriteDescriptorSet::builder()
+                        .dst_set(descriptor_sets[i])
+                        .dst_binding(0)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(buffer_info);
+
+                    unsafe {
+                        device.update_descriptor_sets(&[ubo_write], &[] as &[vk::CopyDescriptorSet]);
+                    }
+            }
+
+            Ok(Self { descriptor_sets })                        
+        }
+    }
+
     struct PipelineWrapper {
         pipeline_layout: vk::PipelineLayout,
         render_pass: vk::RenderPass,
@@ -899,7 +1054,7 @@ mod vulkan {
     }
 
     impl PipelineWrapper {
-        fn new(device: Arc<DeviceWrapper>, swapchain_extent: vk::Extent2D, swapchain_format: vk::Format) -> Result<Self> {
+        fn new(device: Arc<DeviceWrapper>, swapchain_extent: vk::Extent2D, swapchain_format: vk::Format, descriptor_set_layout: &DescriptorSetLayoutWrapper) -> Result<Self> {
             let vert = include_bytes!("../shaders/vert.spv");
             let frag = include_bytes!("../shaders/frag.spv");
 
@@ -961,7 +1116,7 @@ mod vulkan {
                 .polygon_mode(vk::PolygonMode::FILL)
                 .line_width(1.0)
                 .cull_mode(vk::CullModeFlags::BACK)
-                .front_face(vk::FrontFace::CLOCKWISE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
                 .depth_bias_enable(false)
             };
                 
@@ -984,7 +1139,9 @@ mod vulkan {
             };
             
             let pipeline_layout ={
-                let layout_info = vk::PipelineLayoutCreateInfo::builder();
+                let set_layouts = &[**descriptor_set_layout];
+                let layout_info = vk::PipelineLayoutCreateInfo::builder()
+                    .set_layouts(set_layouts);
                 unsafe {
                     logical_device.create_pipeline_layout(&layout_info, None)?
                 }
@@ -1092,8 +1249,87 @@ mod vulkan {
         }
     }
 
-    struct CommandWrapper {
+    struct QueueFamilyIndices {
+        graphics: u32,
+        present: u32,
+    }
+
+    impl QueueFamilyIndices {
+        fn new(instance: &InstanceWrapper, physical_device: vk::PhysicalDevice) -> Result<Self> {
+            let InstanceWrapper { entry: _, messenger: _, surface, instance } = instance;
+            
+            let properties = unsafe {
+                instance
+                    .get_physical_device_queue_family_properties(physical_device)
+            };
+
+            let graphics = properties
+                .iter()
+                .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .map(|i| i as u32);
+
+            let mut present = None;
+            for (index, properties) in properties.iter().enumerate() {
+                unsafe {
+                    if instance.get_physical_device_surface_support_khr(physical_device, index as u32, *surface)? {
+                        present = Some(index as u32);
+                        break;
+                    }
+                }
+            }
+
+            if let (Some(graphics), Some(present)) = (graphics, present) {
+                Ok(Self { graphics, present })
+            } else {
+                Err(anyhow!(SuitabilityError("Missing required queue families")))
+            }
+        }
+    }
+
+    struct CommandPoolWrapper {
         command_pool: vk::CommandPool,
+        device: Arc<DeviceWrapper>,
+    }
+
+    impl CommandPoolWrapper {
+        fn new(instance: &InstanceWrapper, device: Arc<DeviceWrapper>) -> Result<Self> {
+            let indices = QueueFamilyIndices::new(instance, device.physical_device)?;
+
+            let info = vk::CommandPoolCreateInfo::builder()
+                .flags(vk::CommandPoolCreateFlags::empty())
+                .queue_family_index(indices.graphics);
+
+            let command_pool = unsafe {
+                device.create_command_pool(&info, None)?
+            };
+
+            Ok(Self { command_pool, device })
+        }
+    }
+
+    impl Drop for CommandPoolWrapper {
+        fn drop(&mut self) {
+            unsafe {
+                self.device.destroy_command_pool(self.command_pool, None);
+            }
+        }
+    }
+    
+    impl Deref for CommandPoolWrapper{
+        type Target = vk::CommandPool;
+
+        fn deref(&self) -> &Self::Target {
+            &self.command_pool
+        }
+    }
+
+    impl DerefMut for CommandPoolWrapper {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.command_pool
+        }
+    }
+
+    struct CommandWrapper {
         command_buffers: Vec<vk::CommandBuffer>,
         // Semaphores to control GPU syncronization
         image_available_semaphores: Vec<vk::Semaphore>,
@@ -1107,13 +1343,15 @@ mod vulkan {
     impl CommandWrapper {
         fn new(instance: &InstanceWrapper, 
                device: Arc<DeviceWrapper>,
+               command_pool: &CommandPoolWrapper,
                framebuffers: &Vec<vk::Framebuffer>, 
                swapchain: &SwapchainWrapper, 
                pipeline: &PipelineWrapper, 
                vertex_buffer: &VertexBuffer,
+               index_buffer: &IndexBuffer,
+               descriptor_sets: &DescriptorSetsWrapper,
         ) -> Result<Self> {
-            let command_pool = CommandWrapper::create_command_pool(instance, &*device)?;
-            let command_buffers  = CommandWrapper::create_command_buffers(&*device, command_pool, framebuffers, swapchain, pipeline, vertex_buffer)?;
+            let command_buffers  = CommandWrapper::create_command_buffers(&*device, **command_pool, framebuffers, swapchain, pipeline, vertex_buffer, index_buffer, descriptor_sets)?;
 
             let (image_available_semaphores, render_finished_semaphores, in_flight_fences) = unsafe {
                 let semaphore_info = vk::SemaphoreCreateInfo::builder();
@@ -1143,24 +1381,21 @@ mod vulkan {
                 .map(|_| vk::Fence::null())
                 .collect();
 
-            Ok(Self { command_pool, command_buffers, image_available_semaphores, render_finished_semaphores, in_flight_fences, images_in_flight, device })
+            Ok(Self { command_buffers, image_available_semaphores, render_finished_semaphores, in_flight_fences, images_in_flight, device })
         }
 
-        fn create_command_pool(instance: &InstanceWrapper, device: &DeviceWrapper) -> Result<vk::CommandPool> {
-            let indices = QueueFamilyIndices::new(instance, device.physical_device)?;
-
-            let info = vk::CommandPoolCreateInfo::builder()
-                .flags(vk::CommandPoolCreateFlags::empty())
-                .queue_family_index(indices.graphics);
-
-            let command_pool = unsafe {
-                device.create_command_pool(&info, None)?
-            };
-
-            Ok(command_pool)
-        }
+        
     
-        fn create_command_buffers(device: &DeviceWrapper, command_pool: vk::CommandPool, framebuffers: &Vec<vk::Framebuffer>, swapchain: &SwapchainWrapper, pipeline: &PipelineWrapper, vertex_buffer: &VertexBuffer) -> Result<Vec<vk::CommandBuffer>> {
+        fn create_command_buffers(
+            device: &DeviceWrapper, 
+            command_pool: vk::CommandPool, 
+            framebuffers: &Vec<vk::Framebuffer>, 
+            swapchain: &SwapchainWrapper, 
+            pipeline: &PipelineWrapper, 
+            vertex_buffer: &VertexBuffer,
+            index_buffer: &IndexBuffer,
+            descriptor_sets: &DescriptorSetsWrapper,
+        ) -> Result<Vec<vk::CommandBuffer>> {
             let allocate_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
@@ -1201,8 +1436,17 @@ mod vulkan {
                 unsafe {
                     device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
                     device.cmd_bind_pipeline(*command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
-                    device.cmd_bind_vertex_buffers(*command_buffer, 0, &[vertex_buffer.vertex_buffer.buffer], &[0]);
-                    device.cmd_draw(*command_buffer, VERTICES.len() as u32, 1, 0, 0);
+                    device.cmd_bind_vertex_buffers(*command_buffer, 0, &[vertex_buffer.buffer.buffer], &[0]);
+                    device.cmd_bind_index_buffer(*command_buffer, index_buffer.buffer.buffer, 0, vk::IndexType::UINT16);
+                    device.cmd_bind_descriptor_sets(
+                        *command_buffer, 
+                        vk::PipelineBindPoint::GRAPHICS, 
+                        pipeline.pipeline_layout, 
+                        0, 
+                        &[descriptor_sets.descriptor_sets[i]], 
+                        &[]
+                    );
+                    device.cmd_draw_indexed(*command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
                     device.cmd_end_render_pass(*command_buffer);
                     device.end_command_buffer(*command_buffer)?;
                 }
@@ -1229,7 +1473,7 @@ mod vulkan {
                     .drain(..)
                     .for_each(|f| self.device.destroy_fence(f, None));
 
-                self.device.destroy_command_pool(self.command_pool, None);
+                
             }
         }
     }
@@ -1279,32 +1523,46 @@ mod vulkan {
         }
     }
 
-    static VERTICES: [Vertex; 3] = [
-        Vertex::new(vec2(0.0, -0.5), vec3(1.0, 0.0, 0.0)),
-        Vertex::new(vec2(0.5, 0.5), vec3(0.0, 1.0, 0.0)),
-        Vertex::new(vec2(-0.5, 0.5), vec3(0.0, 0.0, 1.0)),
+    static VERTICES: [Vertex; 4] = [
+        Vertex::new(vec2(-0.5, -0.5), vec3(1.0, 0.0, 0.0)),
+        Vertex::new(vec2(0.5, -0.5), vec3(0.0, 1.0, 0.0)),
+        Vertex::new(vec2(0.5, 0.5), vec3(0.0, 0.0, 1.0)),
+        Vertex::new(vec2(-0.5, 0.5), vec3(1.0, 1.0, 1.0)),
     ];
+
+    const INDICES: &[u16] = &[0,1,2,2,3,0];
+
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
+    struct  UniformBufferObject {
+        model: Mat4,
+        view: Mat4,
+        proj: Mat4,
+    }
+
 
     // Buffers
 
     use std::ptr::copy_nonoverlapping as memcpy;
 
-    struct Buffer {
+    struct BufferWrapper {
         buffer_info: BufferCreateInfoBuilder<'static>,
         buffer_memory: vk::DeviceMemory,
         buffer: vk::Buffer,
         device: Arc<DeviceWrapper>,
     }
 
-    impl Buffer {
+    impl BufferWrapper {
         fn new(instance: &InstanceWrapper,
-               device: Arc<DeviceWrapper>, 
+               device: Arc<DeviceWrapper>,
+               size: vk::DeviceSize,
                properties: vk::MemoryPropertyFlags, 
                usage: vk::BufferUsageFlags,
             ) -> Result<Self> {
             
             let buffer_info = vk::BufferCreateInfo::builder()
-                .size((size_of::<Vertex>() * VERTICES.len()) as u64)
+                .size(size)
                 .usage(usage)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -1319,7 +1577,7 @@ mod vulkan {
 
             let memory_info = vk::MemoryAllocateInfo::builder()
                 .allocation_size(requirements.size)
-                .memory_type_index(DeviceWrapper::get_memory_type_index(device.physical_device, instance, properties, requirements)?);
+                .memory_type_index(device.get_memory_type_index(instance, properties, requirements)?);
 
             let buffer_memory = unsafe {
                 device.allocate_memory(&memory_info, None)?  
@@ -1331,9 +1589,46 @@ mod vulkan {
 
             Ok(Self { buffer_memory, buffer, buffer_info, device })
         }
+
+        // Copies given other buffer into this one
+        fn copy_buffer_into(&mut self, src_buffer: BufferWrapper, command_pool: &CommandPoolWrapper) -> Result<()> {
+            let info = vk::CommandBufferAllocateInfo::builder()
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_pool(**command_pool)
+                .command_buffer_count(1);
+
+            let command_buffer = unsafe {
+                self.device.allocate_command_buffers(&info)?[0]
+            };
+
+            let info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+            unsafe {
+                self.device.begin_command_buffer(command_buffer, &info)?;
+
+                let regions = vk::BufferCopy::builder().size(src_buffer.buffer_info.size);
+                self.device.cmd_copy_buffer(command_buffer, src_buffer.buffer, self.buffer, &[regions]);
+
+                self.device.end_command_buffer(command_buffer)?;
+            };
+
+            let command_buffers = &[command_buffer];
+            let info = vk::SubmitInfo::builder()
+                .command_buffers(command_buffers);
+
+            unsafe {
+                self.device.queue_submit(self.device.graphics_queue, &[info], vk::Fence::null())?;
+                self.device.queue_wait_idle(self.device.graphics_queue)?;
+
+                self.device.free_command_buffers(**command_pool, command_buffers);
+            }
+
+            Ok(())
+        }
     }
 
-    impl Drop for Buffer {
+    impl Drop for BufferWrapper {
         fn drop(&mut self) {
             unsafe {
                 self.device.destroy_buffer(self.buffer, None);
@@ -1343,38 +1638,126 @@ mod vulkan {
     }
 
     struct VertexBuffer {
-        vertex_buffer: Buffer
+        buffer: BufferWrapper
     }
 
     impl VertexBuffer {
-        fn new(instance: &InstanceWrapper,
-               device: Arc<DeviceWrapper>,
+        fn new(
+            instance: &InstanceWrapper,
+            device: Arc<DeviceWrapper>,
+            command_pool: &CommandPoolWrapper,
         ) -> Result<Self> {
+            let size = (size_of::<Vertex>() * VERTICES.len()) as u64;
 
-            let vertex_buffer = Buffer::new(
+            let staging_buffer = BufferWrapper::new(
                 instance, 
-                device.clone(),
-                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE, 
-                vk::BufferUsageFlags::VERTEX_BUFFER
+                device.clone(), 
+                size, 
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
 
             let memory = unsafe {
                 device.map_memory(
-                    vertex_buffer.buffer_memory, 
+                    staging_buffer.buffer_memory, 
                     0, 
-                    vertex_buffer.buffer_info.size,
+                    staging_buffer.buffer_info.size,
                     vk::MemoryMapFlags::empty()
+                )
+            }?;
+            
+            unsafe {
+                memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+                device.unmap_memory(staging_buffer.buffer_memory);
+            };  
+
+            let mut buffer = BufferWrapper::new(
+                instance, 
+                device.clone(),
+                size,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL, 
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+            )?;
+
+            buffer.copy_buffer_into(staging_buffer, command_pool)?;
+
+            Ok(Self { buffer })
+        }
+    }
+
+    struct IndexBuffer {
+        buffer: BufferWrapper,
+    }
+
+    impl IndexBuffer {
+        fn new(
+            instance: &InstanceWrapper,
+            device: Arc<DeviceWrapper>,
+            command_pool: &CommandPoolWrapper,
+        ) -> Result<Self> {
+            let size = (size_of::<u16>() * INDICES.len()) as u64;
+
+            let staging_buffer = BufferWrapper::new(
+                instance, 
+                device.clone(), 
+                size, 
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE, 
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            )?;
+
+            let memory = unsafe {
+                device.map_memory(
+                    staging_buffer.buffer_memory, 
+                    0, 
+                    size, 
+                    vk::MemoryMapFlags::empty(),
                 )
             }?;
 
             unsafe {
-                memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
-                device.unmap_memory(vertex_buffer.buffer_memory);
-            };
+                memcpy(INDICES.as_ptr(), memory.cast(), INDICES.len());
 
-            Ok(Self { vertex_buffer })
+                device.unmap_memory(staging_buffer.buffer_memory);
+            }
+
+            let mut buffer = BufferWrapper::new(
+                instance, 
+                device.clone(),
+                size, 
+                vk::MemoryPropertyFlags::DEVICE_LOCAL, 
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
+            )?;
+
+            buffer.copy_buffer_into(staging_buffer, command_pool)?;
+
+            Ok(Self { buffer })
         }
     }
 
+    struct UniformBuffers {
+        buffers: Vec<BufferWrapper>,
+    }
+
+    impl UniformBuffers {
+        fn new(
+            instance: &InstanceWrapper,
+            device: Arc<DeviceWrapper>,
+            swapchain: &SwapchainWrapper,
+        ) -> Result<Self> {
+            let mut buffers = Vec::new();
+
+            for _ in 0..swapchain.swapchain_images.len() {
+                buffers.push(BufferWrapper::new(
+                    instance, 
+                    device.clone(), 
+                    size_of::<UniformBufferObject>() as u64, 
+                    vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE, 
+                    vk::BufferUsageFlags::UNIFORM_BUFFER
+                )?);
+            }
+
+            Ok(Self { buffers })
+        }
+    }
 }
 
