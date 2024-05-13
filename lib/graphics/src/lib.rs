@@ -1,4 +1,4 @@
-use anyhow::{Result,anyhow};
+use anyhow::Result;
 use winit::window::Window;
 //use control::control::{InstructionBuffer,Instruction, Layer};
 use layers::Layer;
@@ -43,16 +43,17 @@ impl Layer for GraphicsHandler {
 /// For holding low-level (unsafe) Vulkan
 mod vulkan {
     // General imports
-    use winit::window::{Window, WindowBuilder};
+    use winit::window::Window;
     use anyhow::{anyhow, Context, Result};
     use thiserror::Error;
     use log::*;
     use std::sync::Arc;
 
     use vulkanalia::loader::{LibloadingLoader, LIBRARY};
-    use vulkanalia::{bytecode, window as vk_window};
+    use vulkanalia::window as vk_window;
     use vulkanalia::prelude::v1_0::*;
-    use vulkanalia::vk::{Buffer, BufferCreateInfoBuilder, ExtDebugUtilsExtension, Image, ImageView, KhrSurfaceExtension, KhrSwapchainExtension, MemoryPropertyFlags, PipelineColorBlendAttachmentState};
+    // use vulkanalia::vk::{BufferCreateInfoBuilder, ExtDebugUtilsExtension, Image, KhrSurfaceExtension, KhrSwapchainExtension};
+    use vulkanalia::vk::{ExtDebugUtilsExtension, KhrSurfaceExtension, KhrSwapchainExtension};
 
     use cgmath::{point3, Deg};
     type Mat4 = cgmath::Matrix4<f32>;
@@ -281,14 +282,23 @@ mod vulkan {
 
             let swapchain_extent = swapchain.swapchain_extent;
 
-            let mut proj = cgmath::perspective(
-                Deg(45.0), 
-                swapchain_extent.width as f32 / swapchain_extent.height as f32, 
-                0.1, 
-                10.0,
+            let correction = Mat4::new(
+                1.0 , 0.0, 0.0, 0.0, 
+                0.0, -1.0, 0.0, 0.0, 
+                0.0, 0.0, 1.0 / 2.0, 0.0, 
+                0.0, 0.0, 1.0 / 2.0, 1.0,
             );
 
-            proj[1][1] *= -1.0;
+            // Transfer from OpenGL depth range [-1.0, 1.0] to Vulkan [0.0, 1.0]
+            let proj = correction *
+                cgmath::perspective(
+                    Deg(45.0), 
+                    swapchain_extent.width as f32 / swapchain_extent.height as f32, 
+                    0.1, 
+                    10.0,
+                );
+
+            // proj[1][1] *= -1.0;
 
             let ubo = UniformBufferObject { model, view, proj };
 
@@ -320,6 +330,7 @@ mod vulkan {
     }
 
     struct RecreateWrapper {
+        depth_image: DepthImageWrapper,
         command: CommandWrapper,
         framebuffers: Vec<vk::Framebuffer>,
         uniform_buffers: UniformBuffers,
@@ -341,23 +352,24 @@ mod vulkan {
             texture: &TextureImageWrapper,
         ) -> Result<Self> {
             let swapchain = SwapchainWrapper::new(instance, device.clone(), window)?;
+            let depth_image = DepthImageWrapper::new(instance, device.clone(), &swapchain)?;
             let uniform_buffers = UniformBuffers::new(instance, device.clone(), &swapchain)?;
-            let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format, descriptor_set_layout)?;
+            let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format, descriptor_set_layout, instance)?;
             let descriptor_pool = DescriptorPoolWrapper::new(device.clone(), &swapchain)?;
             let descriptor_sets = DescriptorSetsWrapper::new(device.clone(), descriptor_set_layout, &descriptor_pool, &swapchain, &uniform_buffers, texture)?;
-            let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass)?;
+            let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass, &depth_image)?;
             let mut command = CommandWrapper::new(&instance, device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, vertex_buffer, index_buffer, &descriptor_sets)?;
             command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
 
-            Ok(Self { command, framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool })
+            Ok(Self { command, framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool, depth_image })
         }
 
-        fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass) -> Result<Vec<vk::Framebuffer>> {
+        fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass, dempth_image: &DepthImageWrapper) -> Result<Vec<vk::Framebuffer>> {
             let framebuffers = 
                 swapchain.swapchain_image_views
                 .iter()
                 .map(|i| {
-                    let attachments = &[i.image_view];
+                    let attachments = &[i.image_view, dempth_image.depth_image_view.image_view];
                     let create_info = vk::FramebufferCreateInfo::builder()
                         .render_pass(*render_pass)
                         .attachments(attachments)
@@ -530,6 +542,20 @@ mod vulkan {
             unsafe {
                 self.instance.destroy_instance(None);
             }
+        }
+    }
+
+    impl Deref for InstanceWrapper {
+        type Target = Instance;
+
+        fn deref(&self) -> &Self::Target {
+            &self.instance
+        }
+    }
+
+    impl DerefMut for InstanceWrapper {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.instance
         }
     }
 
@@ -868,11 +894,16 @@ mod vulkan {
             Ok(Self { swapchain_format: surface_format.format, swapchain_extent, swapchain, swapchain_images, swapchain_image_views, device })
         }
 
-        fn create_swapchain_image_views(swapchain_format: vk::Format, swapchain_images: &Vec<Image>, device: &Arc<DeviceWrapper>) -> Result<Vec<ImageViewWrapper>> {
+        fn create_swapchain_image_views(swapchain_format: vk::Format, swapchain_images: &Vec<vk::Image>, device: &Arc<DeviceWrapper>) -> Result<Vec<ImageViewWrapper>> {
             Ok(swapchain_images
                     .iter()
                     .map(|i| {
-                        ImageViewWrapper::new(device.clone(), *i, swapchain_format)
+                        ImageViewWrapper::new(
+                            device.clone(), 
+                            *i, 
+                            swapchain_format,
+                            vk::ImageAspectFlags::COLOR,
+                        )
                         // SwapchainWrapper::create_image_view(swapchain_format, logical_device, *i, vk::ImageAspectFlags::COLOR)
                     })
                     .collect::<Result<Vec<_>,_>>()?)
@@ -1053,7 +1084,7 @@ mod vulkan {
                 let info = vk::DescriptorImageInfo::builder()
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image_view(texture_image.image.image_view.image_view)
-                    .sampler(texture_image.image.sampler.sampler);
+                    .sampler(texture_image.sampler.sampler);
 
                 let image_info = &[info];
                 let sampler_write = vk::WriteDescriptorSet::builder()
@@ -1082,7 +1113,13 @@ mod vulkan {
     }
 
     impl PipelineWrapper {
-        fn new(device: Arc<DeviceWrapper>, swapchain_extent: vk::Extent2D, swapchain_format: vk::Format, descriptor_set_layout: &DescriptorSetLayoutWrapper) -> Result<Self> {
+        fn new(
+            device: Arc<DeviceWrapper>, 
+            swapchain_extent: vk::Extent2D, 
+            swapchain_format: vk::Format, 
+            descriptor_set_layout: &DescriptorSetLayoutWrapper,
+            instance: &InstanceWrapper,
+         ) -> Result<Self> {
             let vert = include_bytes!("../shaders/shader.vert.spv");
             let frag = include_bytes!("../shaders/shader.frag.spv");
 
@@ -1152,7 +1189,17 @@ mod vulkan {
                 .sample_shading_enable(false)
                 .rasterization_samples(vk::SampleCountFlags::_1)
             };
-            
+
+            let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::builder()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS)
+                .depth_bounds_test_enable(false)
+                .min_depth_bounds(0.0)
+                .max_depth_bounds(1.0)
+                .stencil_test_enable(false);
+                // .front and .back required for use of stencil
+
             let attachment = {vk::PipelineColorBlendAttachmentState::builder()
                 .color_write_mask(vk::ColorComponentFlags::all())
                 .blend_enable(false)
@@ -1189,6 +1236,16 @@ mod vulkan {
                     .initial_layout(vk::ImageLayout::UNDEFINED)
                     .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
 
+                let depth_stencil_attachment = vk::AttachmentDescription::builder()
+                    .format(DepthImageWrapper::get_depth_format(&device, instance)?)
+                    .samples(vk::SampleCountFlags::_1)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
 
                 // Subpasses
                 let color_attachment_ref = vk::AttachmentReference::builder()
@@ -1196,20 +1253,32 @@ mod vulkan {
                     .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
                 let color_attachments = &[color_attachment_ref];
+
+
+                let depth_stencil_attachment_ref = vk::AttachmentReference::builder()
+                    .attachment(1)
+                    .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
                 let subpass = vk::SubpassDescription::builder()
                     .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(color_attachments);
+                    .color_attachments(color_attachments)
+                    .depth_stencil_attachment(&depth_stencil_attachment_ref);
+
+                
 
                 // Dependencies
                 let dependency = vk::SubpassDependency::builder()
                     .src_subpass(vk::SUBPASS_EXTERNAL)
                     .dst_subpass(0)
-                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                    .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT 
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
                     .src_access_mask(vk::AccessFlags::empty())
-                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+                    .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
 
-                let attachments = &[color_attachment];
+                let attachments = &[color_attachment, depth_stencil_attachment];
                 let subpasses = &[subpass];
                 let dependencies = &[dependency];
                 let info = vk::RenderPassCreateInfo::builder()
@@ -1229,6 +1298,7 @@ mod vulkan {
                 .viewport_state(&viewport_state)
                 .rasterization_state(&rasterization_state)
                 .multisample_state(&multisample_state)
+                .depth_stencil_state(&depth_stencil_state)
                 .color_blend_state(&color_blend_state)
                 .layout(pipeline_layout)
                 .render_pass(render_pass)
@@ -1239,6 +1309,8 @@ mod vulkan {
                 logical_device.create_graphics_pipelines(
                     vk::PipelineCache::null(), &[info], None)?.0[0]
             };
+
+
 
             // Clean up shader_modules at end
             unsafe {
@@ -1464,7 +1536,14 @@ mod vulkan {
                     },
                 };
 
-                let clear_values = &[color_clear_value];
+                let depth_clear_value = vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                };
+
+                let clear_values = &[color_clear_value, depth_clear_value];
                 let info = vk::RenderPassBeginInfo::builder()
                     .render_pass(pipeline.render_pass)
                     .framebuffer(framebuffers[i])
@@ -1569,13 +1648,13 @@ mod vulkan {
     #[repr(C)]
     #[derive(Copy, Clone, Debug)]
     struct Vertex {
-        pos: Vec2,
+        pos: Vec3,
         color: Vec3,
         tex_coord: Vec2,
     }
 
     impl Vertex {
-        const  fn new(pos: Vec2, color: Vec3, tex_coord: Vec2) -> Self {
+        const fn new(pos: Vec3, color: Vec3, tex_coord: Vec2) -> Self {
             Self {pos, color, tex_coord}
         }
 
@@ -1591,7 +1670,7 @@ mod vulkan {
             let pos = vk::VertexInputAttributeDescription::builder()
                 .binding(0)
                 .location(0)
-                .format(vk::Format::R32G32_SFLOAT)
+                .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(0)
                 .build();
 
@@ -1599,44 +1678,67 @@ mod vulkan {
                 .binding(0)
                 .location(1)
                 .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(size_of::<Vec2>() as u32)
+                .offset(size_of::<Vec3>() as u32)
                 .build();
 
             let tex_coord = vk::VertexInputAttributeDescription::builder()
                 .binding(0)
                 .location(2)
                 .format(vk::Format::R32G32_SFLOAT)
-                .offset((size_of::<Vec2>() + size_of::<Vec3>()) as u32)
+                .offset((size_of::<Vec3>() + size_of::<Vec3>()) as u32)
                 .build();
 
             [pos, color, tex_coord]
         }
     }
 
-    static VERTICES: [Vertex; 4] = [
+    static VERTICES: [Vertex; 8] = [
         Vertex::new(
-            vec2(-0.5, -0.5), 
+            vec3(-0.5, -0.5, 0.0), 
             vec3(1.0, 0.0, 0.0),
             vec2(1.0, 0.0),
         ),
         Vertex::new(
-            vec2(0.5, -0.5), 
+            vec3(0.5, -0.5, 0.0), 
             vec3(0.0, 1.0, 0.0),
             vec2(0.0, 0.0),
         ),
         Vertex::new(
-            vec2(0.5, 0.5), 
+            vec3(0.5, 0.5, 0.0), 
             vec3(0.0, 0.0, 1.0),
             vec2(0.0, 1.0),
         ),
         Vertex::new(
-            vec2(-0.5, 0.5), 
+            vec3(-0.5, 0.5, 0.0), 
+            vec3(1.0, 1.0, 1.0),
+            vec2(1.0, 1.0),
+        ),
+        Vertex::new(
+            vec3(-0.5, -0.5, -0.5), 
+            vec3(1.0, 0.0, 0.0),
+            vec2(1.0, 0.0),
+        ),
+        Vertex::new(
+            vec3(0.5, -0.5, -0.5), 
+            vec3(0.0, 1.0, 0.0),
+            vec2(0.0, 0.0),
+        ),
+        Vertex::new(
+            vec3(0.5, 0.5, -0.5), 
+            vec3(0.0, 0.0, 1.0),
+            vec2(0.0, 1.0),
+        ),
+        Vertex::new(
+            vec3(-0.5, 0.5, -0.5), 
             vec3(1.0, 1.0, 1.0),
             vec2(1.0, 1.0),
         ),
     ];
 
-    const INDICES: &[u16] = &[0,1,2,2,3,0];
+    const INDICES: &[u16] = &[
+        0,1,2,2,3,0,
+        4,5,6,6,7,4,
+    ];
 
 
     #[repr(C)]
@@ -1653,7 +1755,7 @@ mod vulkan {
     use std::ptr::copy_nonoverlapping as memcpy;
 
     struct BufferWrapper {
-        buffer_info: BufferCreateInfoBuilder<'static>,
+        buffer_info: vk::BufferCreateInfoBuilder<'static>,
         buffer_memory: vk::DeviceMemory,
         buffer: vk::Buffer,
         device: Arc<DeviceWrapper>,
@@ -1886,7 +1988,7 @@ mod vulkan {
 
     struct TextureImageWrapper {
         image: ImageWrapper,
-
+        sampler: SamplerWrapper,
     }
 
     impl TextureImageWrapper {
@@ -1939,6 +2041,7 @@ mod vulkan {
                 vk::ImageTiling::OPTIMAL, 
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, 
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::ImageAspectFlags::COLOR,
             )?;
             
 
@@ -1965,16 +2068,102 @@ mod vulkan {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL, 
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             )?;
+
+            let sampler = SamplerWrapper::new(device.clone())?;
             
-            Ok(Self { image })
+            Ok(Self { image, sampler })
         }
     }
 
+    struct DepthImageWrapper {
+        depth_image: ImageWrapper,
+        depth_image_view: ImageViewWrapper,
+    }
+
+    impl DepthImageWrapper {
+        fn new(
+            instance: &InstanceWrapper,
+            device: Arc<DeviceWrapper>,
+            swapchain: &SwapchainWrapper,
+        ) -> Result<Self> {
+            let format = DepthImageWrapper::get_depth_format(&device, instance)?;
+
+            let depth_image = ImageWrapper::new(
+                instance, 
+                device.clone(), 
+                swapchain.swapchain_extent.width, 
+                swapchain.swapchain_extent.height, 
+                format, 
+                vk::ImageTiling::OPTIMAL, 
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, 
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::ImageAspectFlags::DEPTH,
+            )?;
+
+            let depth_image_view = ImageViewWrapper::new(
+                device.clone(), 
+                depth_image.image, 
+                format,
+                vk::ImageAspectFlags::DEPTH,
+            )?;
+
+
+
+            Ok(Self { depth_image, depth_image_view })
+        }
+
+        fn get_supported_format(
+            device: &Arc<DeviceWrapper>,
+            instance: &InstanceWrapper,
+            candidates: &[vk::Format],
+            tiling: vk::ImageTiling,
+            features: vk::FormatFeatureFlags,
+        ) -> Result<vk::Format> {
+            candidates
+                .iter()
+                .cloned()
+                .find(|f| {
+                    let properties = unsafe {
+                        instance.get_physical_device_format_properties(
+                            device.physical_device, 
+                            *f,
+                        )
+                    };
+                    match tiling {
+                        vk::ImageTiling::LINEAR => properties.linear_tiling_features.contains(features),
+                        vk::ImageTiling::OPTIMAL => properties.optimal_tiling_features.contains(features),
+                        _ => true,
+                    }
+                })
+                .ok_or_else(|| anyhow!("Failed to find supported format for depth buffer"))
+        }
+
+        fn get_depth_format(
+            device: &Arc<DeviceWrapper>,
+            instance: &InstanceWrapper,
+        ) -> Result<vk::Format> {
+            let candidates = &[
+                vk::Format::D32_SFLOAT,
+                vk::Format::D32_SFLOAT_S8_UINT,
+                vk::Format::D24_UNORM_S8_UINT,
+            ];
+
+            DepthImageWrapper::get_supported_format(
+                device, 
+                instance, 
+                candidates, 
+                vk::ImageTiling::OPTIMAL, 
+                vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT,
+            )
+        }
+
+
+    }
+    
     struct ImageWrapper {
         image: vk::Image,
         image_memory: vk::DeviceMemory,
         image_view: ImageViewWrapper,
-        sampler: SamplerWrapper,
         device: Arc<DeviceWrapper>,
     }
 
@@ -1988,6 +2177,7 @@ mod vulkan {
             tiling: vk::ImageTiling,
             usage: vk::ImageUsageFlags,
             properties: vk::MemoryPropertyFlags,
+            aspects: vk::ImageAspectFlags,
         ) -> Result<Self> {
             let image = unsafe {
                 let info = vk::ImageCreateInfo::builder()
@@ -2028,12 +2218,11 @@ mod vulkan {
             let image_view = ImageViewWrapper::new(
                 device.clone(), 
                 image, 
-                vk::Format::R8G8B8A8_SRGB,
+                format,
+                aspects,
             )?;
 
-            let sampler = SamplerWrapper::new(device.clone())?;
-
-            Ok(Self { image, image_memory, image_view, sampler, device })
+            Ok(Self { image, image_memory, image_view, device })
         }
 
     
@@ -2170,9 +2359,10 @@ mod vulkan {
             device: Arc<DeviceWrapper>,
             image: vk::Image,
             format: vk::Format,
+            aspects: vk::ImageAspectFlags,
         ) -> Result<Self> {
             let subresource_range = vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .aspect_mask(aspects)
                 .base_mip_level(0)
                 .level_count(1)
                 .base_array_layer(0)
