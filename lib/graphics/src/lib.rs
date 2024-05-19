@@ -58,7 +58,9 @@ mod vulkan {
     use cgmath::{point3, Deg};
     type Mat4 = cgmath::Matrix4<f32>;
 
-    use std::collections::HashSet;
+    use std::collections::{HashSet, HashMap};
+    use std::hash::{Hash, Hasher};
+    use std::io::BufReader;
     use std::ffi::CStr;
     use std::os::raw::c_void;
     use std::ops::{Deref, DerefMut};
@@ -112,9 +114,8 @@ mod vulkan {
    // Note: drop executed in order first to last
     pub struct VulkanHandler {
         recreate: Option<RecreateWrapper>, // Handles objects that may be recreated
-        texture: TextureImageWrapper,
-        index_buffer: IndexBuffer,
-        vertex_buffer: VertexBuffer,
+        model: Model,
+        //texture: TextureImageWrapper,
         descriptor_set_layout: DescriptorSetLayoutWrapper,
         command_pool: CommandPoolWrapper,
         device: Arc<DeviceWrapper>, // Destroyed after all other objects
@@ -131,12 +132,11 @@ mod vulkan {
             let device = Arc::new(DeviceWrapper::new(&instance, window)?);
             let command_pool = CommandPoolWrapper::new(&instance, device.clone())?;
             let descriptor_set_layout = DescriptorSetLayoutWrapper::new(device.clone())?;
-            let vertex_buffer = VertexBuffer::new(&instance, device.clone(), &command_pool)?;
-            let index_buffer = IndexBuffer::new(&instance, device.clone(), &command_pool)?;
-            let texture = TextureImageWrapper::new(&instance, device.clone(), &command_pool)?;
-            let recreate = Some(RecreateWrapper::new(device.clone(), &instance, window, &vertex_buffer, &index_buffer, &command_pool, &descriptor_set_layout, &texture)?);
+            // let texture = TextureImageWrapper::new(&instance, device.clone(), &command_pool)?;
+            let model = Model::new(&instance, device.clone(), &command_pool)?;
+            let recreate = Some(RecreateWrapper::new(device.clone(), &instance, window, &command_pool, &descriptor_set_layout, &model)?);
 
-            Ok(Self {instance, device, frame: 0, resized: false,vertex_buffer, index_buffer, recreate, command_pool, descriptor_set_layout, start: Instant::now(), texture})
+            Ok(Self {instance, device, frame: 0, resized: false, recreate, command_pool, descriptor_set_layout, start: Instant::now(), model})
         }
 
         pub fn render(&mut self, window: &Window) -> Result<()> {
@@ -260,7 +260,7 @@ mod vulkan {
             };
 
             self.recreate = None;
-            self.recreate = Some(RecreateWrapper::new(self.device.clone(), &self.instance, window, &self.vertex_buffer, &self.index_buffer, &self.command_pool, &self.descriptor_set_layout, &self.texture)?);
+            self.recreate = Some(RecreateWrapper::new(self.device.clone(), &self.instance, window, &self.command_pool, &self.descriptor_set_layout, &self.model)?);
             
             
 
@@ -297,8 +297,6 @@ mod vulkan {
                     0.1, 
                     10.0,
                 );
-
-            // proj[1][1] *= -1.0;
 
             let ubo = UniformBufferObject { model, view, proj };
 
@@ -345,20 +343,21 @@ mod vulkan {
             device: Arc<DeviceWrapper>, 
             instance: &InstanceWrapper, 
             window: &Window, 
-            vertex_buffer: &VertexBuffer,
-            index_buffer: &IndexBuffer,
+            // vertex_buffer: &VertexBuffer,
+            // index_buffer: &IndexBuffer,
             command_pool: &CommandPoolWrapper,
             descriptor_set_layout: &DescriptorSetLayoutWrapper,
-            texture: &TextureImageWrapper,
+            // texture: &TextureImageWrapper,
+            model: &Model,
         ) -> Result<Self> {
             let swapchain = SwapchainWrapper::new(instance, device.clone(), window)?;
             let depth_image = DepthImageWrapper::new(instance, device.clone(), &swapchain)?;
             let uniform_buffers = UniformBuffers::new(instance, device.clone(), &swapchain)?;
             let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format, descriptor_set_layout, instance)?;
             let descriptor_pool = DescriptorPoolWrapper::new(device.clone(), &swapchain)?;
-            let descriptor_sets = DescriptorSetsWrapper::new(device.clone(), descriptor_set_layout, &descriptor_pool, &swapchain, &uniform_buffers, texture)?;
+            let descriptor_sets = DescriptorSetsWrapper::new(device.clone(), descriptor_set_layout, &descriptor_pool, &swapchain, &uniform_buffers, model)?;
             let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass, &depth_image)?;
-            let mut command = CommandWrapper::new(&instance, device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, vertex_buffer, index_buffer, &descriptor_sets)?;
+            let mut command = CommandWrapper::new(&instance, device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, &descriptor_sets, &model)?;
             command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
 
             Ok(Self { command, framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool, depth_image })
@@ -1055,7 +1054,8 @@ mod vulkan {
             descriptor_pool: &DescriptorPoolWrapper,
             swapchain: &SwapchainWrapper,
             uniform_buffers: &UniformBuffers,
-            texture_image: &TextureImageWrapper,
+            // texture_image: &TextureImageWrapper,
+            model: &Model,
 
         ) -> Result<Self> {
             let layouts = vec![descriptor_set_layout.descriptor_set_layout; swapchain.swapchain_images.len()];
@@ -1083,8 +1083,8 @@ mod vulkan {
 
                 let info = vk::DescriptorImageInfo::builder()
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image_view(texture_image.image.image_view.image_view)
-                    .sampler(texture_image.sampler.sampler);
+                    .image_view(model.image.image_view.image_view)
+                    .sampler(model.sampler.sampler);
 
                 let image_info = &[info];
                 let sampler_write = vk::WriteDescriptorSet::builder()
@@ -1457,11 +1457,18 @@ mod vulkan {
                framebuffers: &Vec<vk::Framebuffer>, 
                swapchain: &SwapchainWrapper, 
                pipeline: &PipelineWrapper, 
-               vertex_buffer: &VertexBuffer,
-               index_buffer: &IndexBuffer,
                descriptor_sets: &DescriptorSetsWrapper,
+               model: &Model,
         ) -> Result<Self> {
-            let command_buffers  = CommandWrapper::create_command_buffers(&*device, **command_pool, framebuffers, swapchain, pipeline, vertex_buffer, index_buffer, descriptor_sets)?;
+            let command_buffers  = CommandWrapper::create_command_buffers(
+                &*device, 
+                **command_pool, 
+                framebuffers, 
+                swapchain, 
+                pipeline, 
+                descriptor_sets,
+                model,
+            )?;
 
             let (image_available_semaphores, render_finished_semaphores, in_flight_fences) = unsafe {
                 let semaphore_info = vk::SemaphoreCreateInfo::builder();
@@ -1501,10 +1508,9 @@ mod vulkan {
             command_pool: vk::CommandPool, 
             framebuffers: &Vec<vk::Framebuffer>, 
             swapchain: &SwapchainWrapper, 
-            pipeline: &PipelineWrapper, 
-            vertex_buffer: &VertexBuffer,
-            index_buffer: &IndexBuffer,
+            pipeline: &PipelineWrapper,
             descriptor_sets: &DescriptorSetsWrapper,
+            model: &Model,
         ) -> Result<Vec<vk::CommandBuffer>> {
             let allocate_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(command_pool)
@@ -1553,8 +1559,8 @@ mod vulkan {
                 unsafe {
                     device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
                     device.cmd_bind_pipeline(*command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
-                    device.cmd_bind_vertex_buffers(*command_buffer, 0, &[vertex_buffer.buffer.buffer], &[0]);
-                    device.cmd_bind_index_buffer(*command_buffer, index_buffer.buffer.buffer, 0, vk::IndexType::UINT16);
+                    device.cmd_bind_vertex_buffers(*command_buffer, 0, &[model.vertex_buffer.buffer.buffer], &[0]);
+                    device.cmd_bind_index_buffer(*command_buffer, model.index_buffer.buffer.buffer, 0, vk::IndexType::UINT32);
                     device.cmd_bind_descriptor_sets(
                         *command_buffer, 
                         vk::PipelineBindPoint::GRAPHICS, 
@@ -1563,7 +1569,7 @@ mod vulkan {
                         &[descriptor_sets.descriptor_sets[i]], 
                         &[]
                     );
-                    device.cmd_draw_indexed(*command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+                    device.cmd_draw_indexed(*command_buffer, model.indices.len() as u32, 1, 0, 0, 0);
                     device.cmd_end_render_pass(*command_buffer);
                     device.end_command_buffer(*command_buffer)?;
                 }
@@ -1692,6 +1698,29 @@ mod vulkan {
         }
     }
 
+    impl PartialEq for Vertex {
+        fn eq(&self, other: &Self) -> bool {
+            self.pos == other.pos
+                && self.color == other.color
+                && self.tex_coord == other.tex_coord
+        }
+    }
+
+    impl Eq for Vertex {}
+
+    impl Hash for Vertex {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.pos[0].to_bits().hash(state);
+            self.pos[1].to_bits().hash(state);
+            self.pos[2].to_bits().hash(state);
+            self.color[0].to_bits().hash(state);
+            self.color[1].to_bits().hash(state);
+            self.color[2].to_bits().hash(state);
+            self.tex_coord[0].to_bits().hash(state);
+            self.tex_coord[1].to_bits().hash(state);
+        }
+    }
+
     static VERTICES: [Vertex; 8] = [
         Vertex::new(
             vec3(-0.5, -0.5, 0.0), 
@@ -1735,7 +1764,7 @@ mod vulkan {
         ),
     ];
 
-    const INDICES: &[u16] = &[
+    const INDICES: &[u32] = &[
         0,1,2,2,3,0,
         4,5,6,6,7,4,
     ];
@@ -1872,8 +1901,9 @@ mod vulkan {
             instance: &InstanceWrapper,
             device: Arc<DeviceWrapper>,
             command_pool: &CommandPoolWrapper,
+            vertices: &Vertices,
         ) -> Result<Self> {
-            let size = (size_of::<Vertex>() * VERTICES.len()) as u64;
+            let size = (size_of::<Vertex>() * vertices.len()) as u64;
 
             let staging_buffer = BufferWrapper::new(
                 instance, 
@@ -1893,7 +1923,7 @@ mod vulkan {
             }?;
             
             unsafe {
-                memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+                memcpy(vertices.as_ptr(), memory.cast(), vertices.len());
                 device.unmap_memory(staging_buffer.buffer_memory);
             };  
 
@@ -1920,8 +1950,9 @@ mod vulkan {
             instance: &InstanceWrapper,
             device: Arc<DeviceWrapper>,
             command_pool: &CommandPoolWrapper,
+            indices: &Indices,
         ) -> Result<Self> {
-            let size = (size_of::<u16>() * INDICES.len()) as u64;
+            let size = (size_of::<u32>() * indices.len()) as u64;
 
             let staging_buffer = BufferWrapper::new(
                 instance, 
@@ -1941,7 +1972,7 @@ mod vulkan {
             }?;
 
             unsafe {
-                memcpy(INDICES.as_ptr(), memory.cast(), INDICES.len());
+                memcpy(indices.as_ptr(), memory.cast(), indices.len());
 
                 device.unmap_memory(staging_buffer.buffer_memory);
             }
@@ -1986,13 +2017,184 @@ mod vulkan {
         }
     }
 
+
+
+    struct Model {
+        image: ImageWrapper,
+        sampler: SamplerWrapper,
+        vertices: Vertices,
+        indices: Indices,
+        index_buffer: IndexBuffer,
+        vertex_buffer: VertexBuffer,
+    }
+
+    type Vertices = Vec<Vertex>;
+    type Indices = Vec<u32>;
+
+    impl Model {
+        fn new(
+            instance: &InstanceWrapper, 
+            device: Arc<DeviceWrapper>, 
+            command_pool: &CommandPoolWrapper,
+        ) -> Result<Self>{
+
+            let (vertices, indices) = Model::load_model()?;
+
+            let vertex_buffer = VertexBuffer::new(&instance, device.clone(), &command_pool, &vertices)?;
+            let index_buffer = IndexBuffer::new(&instance, device.clone(), &command_pool, &indices)?;
+
+            let image = File::open("resources/viking_room.png").context("Texture file failure")?;
+
+            let decoder = png::Decoder::new(image);
+            let mut reader = decoder.read_info()?;
+
+            let mut pixels = vec![0; reader.info().raw_bytes()];
+            reader.next_frame(&mut pixels)?;
+
+            let size = reader.info().raw_bytes() as u64;
+            let (width, height) = reader.info().size();
+
+            if width != 1024 || height != 1024 || reader.info().color_type != png::ColorType::Rgba {
+                return Err(anyhow!("Invalid texture image"));
+            }
+
+            // Create (Staging)
+
+            let staging_buffer = 
+                BufferWrapper::new(
+                    instance, 
+                    device.clone(), 
+                    size, 
+                    vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE, 
+                    vk::BufferUsageFlags::TRANSFER_SRC
+                )?;
+
+            // Create (Image)
+
+            let memory = unsafe {
+                device.map_memory(
+                    staging_buffer.buffer_memory, 
+                    0, 
+                    size, 
+                    vk::MemoryMapFlags::empty()
+                )?
+            };
+
+            unsafe {
+                memcpy(pixels.as_ptr(), memory.cast(), pixels.len());
+
+                device.unmap_memory(staging_buffer.buffer_memory);
+            }
+
+            let mut image = ImageWrapper::new(
+                instance, 
+                device.clone(), 
+                width, 
+                height, 
+                vk::Format::R8G8B8A8_SRGB, 
+                vk::ImageTiling::OPTIMAL, 
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, 
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::ImageAspectFlags::COLOR,
+            )?;
+            
+
+            // Transition + Copy (Image)
+
+            image.transition_layout(
+                command_pool, 
+                vk::Format::R8G8B8A8_SRGB, 
+                vk::ImageLayout::UNDEFINED, 
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            )?;
+
+            image.copy_buffer_to_image(
+                device.clone(), 
+                command_pool, 
+                staging_buffer, 
+                width, 
+                height,
+            )?;
+
+            image.transition_layout(
+                command_pool, 
+                vk::Format::R8G8B8A8_SRGB, 
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL, 
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            )?;
+
+            let sampler = SamplerWrapper::new(device.clone())?;
+            
+            Ok(Self { image, sampler, vertex_buffer, index_buffer, vertices, indices })
+        }
+
+        fn load_model(
+
+        ) -> Result<(Vertices, Indices)> {
+
+            let mut reader = BufReader::new(File::open("resources/viking_room.obj")?);
+
+            let (modles, _) = tobj::load_obj_buf(
+                &mut reader, 
+                &tobj::LoadOptions {triangulate: true, ..Default::default()}, 
+                |_| Ok(Default::default()),
+            )?;
+
+            let mut vertices: Vertices = Vec::new();
+            let mut indices: Indices = Vec::new();
+
+            let mut unqiue_vertices = HashMap::new();
+
+            for model in &modles {
+                for index in &model.mesh.indices {
+
+                    let pos_offset = (3 * index) as usize;
+                    let tex_coord_offset = (2 * index) as usize;
+
+                    let vertex = Vertex {
+                        pos: vec3(
+                            model.mesh.positions[pos_offset],
+                            model.mesh.positions[pos_offset + 1],
+                            model.mesh.positions[pos_offset + 2],
+                        ),
+                        color: vec3(1.0, 1.0, 1.0),
+                        tex_coord: vec2(
+                            model.mesh.texcoords[tex_coord_offset],
+                            1.0 - model.mesh.texcoords[tex_coord_offset + 1],
+                        ),
+                    };
+
+                    if let Some(index) = unqiue_vertices.get(&vertex) {
+                        indices.push(*index as u32);
+                    } else {
+                        let index = vertices.len();
+                        unqiue_vertices.insert(vertex, index);
+                        vertices.push(vertex);
+                        indices.push(index as u32);
+                    }
+                }
+            }
+
+            Ok((vertices, indices))
+        }
+    }
+
     struct TextureImageWrapper {
         image: ImageWrapper,
         sampler: SamplerWrapper,
+        index_buffer: IndexBuffer,
+        vertex_buffer: VertexBuffer,
     }
 
     impl TextureImageWrapper {
         fn new(instance: &InstanceWrapper, device: Arc<DeviceWrapper>, command_pool: &CommandPoolWrapper) -> Result<Self> {
+            
+            let mut vertices: Vertices = VERTICES.to_vec();
+            let mut indices: Indices = INDICES.to_vec();
+
+            let vertex_buffer = VertexBuffer::new(&instance, device.clone(), &command_pool, &vertices)?;
+            let index_buffer = IndexBuffer::new(&instance, device.clone(), &command_pool, &indices)?;
+
             let image = File::open("resources/texture.png").context("Texture file failure")?;
 
             let decoder = png::Decoder::new(image);
@@ -2071,8 +2273,10 @@ mod vulkan {
 
             let sampler = SamplerWrapper::new(device.clone())?;
             
-            Ok(Self { image, sampler })
+            Ok(Self { image, sampler, vertex_buffer, index_buffer })
         }
+
+        
     }
 
     struct DepthImageWrapper {

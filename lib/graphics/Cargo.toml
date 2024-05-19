@@ -16,3 +16,4 @@ layers = {path = "../layers"}
 tokio = { version = "1.36.0", features = ["full"]}
 cgmath = "0.18.0"
 png = "0.17.13"
+tobj = "4.0.2"
