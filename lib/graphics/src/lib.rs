@@ -129,7 +129,7 @@ mod vulkan {
     impl VulkanHandler {
         pub fn new(window: &Window) -> Result<Self> {
             let instance = InstanceWrapper::new(window)?;
-            let device = Arc::new(DeviceWrapper::new(&instance, window)?);
+            let device = Arc::new(DeviceWrapper::new(&instance)?);
             let command_pool = CommandPoolWrapper::new(&instance, device.clone())?;
             let descriptor_set_layout = DescriptorSetLayoutWrapper::new(device.clone())?;
             // let texture = TextureImageWrapper::new(&instance, device.clone(), &command_pool)?;
@@ -298,7 +298,7 @@ mod vulkan {
                     10.0,
                 );
 
-            let ubo = UniformBufferObject { model, view, proj };
+            let ubo = UniformBufferObject { view, proj };
 
             let memory = unsafe {
                 device.map_memory(
@@ -329,6 +329,7 @@ mod vulkan {
 
     struct RecreateWrapper {
         depth_image: DepthImageWrapper,
+        color_image: ColorImageWrapper,
         command: CommandWrapper,
         framebuffers: Vec<vk::Framebuffer>,
         uniform_buffers: UniformBuffers,
@@ -351,24 +352,25 @@ mod vulkan {
             model: &Model,
         ) -> Result<Self> {
             let swapchain = SwapchainWrapper::new(instance, device.clone(), window)?;
+            let color_image = ColorImageWrapper::new(instance, device.clone(), &swapchain)?;
             let depth_image = DepthImageWrapper::new(instance, device.clone(), &swapchain)?;
             let uniform_buffers = UniformBuffers::new(instance, device.clone(), &swapchain)?;
             let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format, descriptor_set_layout, instance)?;
             let descriptor_pool = DescriptorPoolWrapper::new(device.clone(), &swapchain)?;
             let descriptor_sets = DescriptorSetsWrapper::new(device.clone(), descriptor_set_layout, &descriptor_pool, &swapchain, &uniform_buffers, model)?;
-            let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass, &depth_image)?;
+            let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass, &depth_image, &color_image)?;
             let mut command = CommandWrapper::new(&instance, device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, &descriptor_sets, &model)?;
             command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
 
-            Ok(Self { command, framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool, depth_image })
+            Ok(Self { command, framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool, depth_image, color_image })
         }
 
-        fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass, dempth_image: &DepthImageWrapper) -> Result<Vec<vk::Framebuffer>> {
+        fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass, depth_image: &DepthImageWrapper, color_image: &ColorImageWrapper) -> Result<Vec<vk::Framebuffer>> {
             let framebuffers = 
                 swapchain.swapchain_image_views
                 .iter()
                 .map(|i| {
-                    let attachments = &[i.image_view, dempth_image.depth_image_view.image_view];
+                    let attachments = &[color_image.color_image_view.image_view, depth_image.depth_image_view.image_view, i.image_view];
                     let create_info = vk::FramebufferCreateInfo::builder()
                         .render_pass(*render_pass)
                         .attachments(attachments)
@@ -566,10 +568,11 @@ mod vulkan {
         present_queue: vk::Queue,
         physical_device: vk::PhysicalDevice,
         logical_device: Device,
+        msaa_samples: vk::SampleCountFlags,
     }
 
     impl DeviceWrapper {
-        fn new(instance: &InstanceWrapper, window: &Window) -> Result<Self> {
+        fn new(instance: &InstanceWrapper) -> Result<Self> {
             unsafe {
                 for physical_device in instance.instance.enumerate_physical_devices()? {
                     let properties = instance.instance.get_physical_device_properties(physical_device);
@@ -580,7 +583,9 @@ mod vulkan {
                         info!("Selected physical device (`{}`)", properties.device_name);
                         let (logical_device, graphics_queue, present_queue) = DeviceWrapper::create_logical_device(instance, physical_device)?;
                         
-                        return Ok(Self { physical_device, logical_device, graphics_queue, present_queue});
+                        let msaa_samples = DeviceWrapper::get_max_msaa_samples(instance, physical_device);
+
+                        return Ok(Self { physical_device, logical_device, graphics_queue, present_queue, msaa_samples});
                     }
                 }
             }
@@ -722,7 +727,30 @@ mod vulkan {
                 })
                 .ok_or_else(|| anyhow!("Failed to find suitable memory type"))
         }
+
         
+        fn get_max_msaa_samples(
+            instance: &Instance,
+            physical_device: vk::PhysicalDevice,
+        ) -> vk::SampleCountFlags {
+            let properties = unsafe {
+                instance.get_physical_device_properties(physical_device)
+            };
+            let counts = properties.limits.framebuffer_color_sample_counts 
+                & properties.limits.framebuffer_depth_sample_counts;
+            [
+                vk::SampleCountFlags::_64,
+                vk::SampleCountFlags::_32,
+                vk::SampleCountFlags::_16,
+                vk::SampleCountFlags::_8,
+                vk::SampleCountFlags::_4,
+                vk::SampleCountFlags::_2,
+            ]
+            .iter()
+            .cloned()
+            .find(|c| counts.contains(*c))
+            .unwrap_or(vk::SampleCountFlags::_1)
+        }   
     }
 
     impl Drop for DeviceWrapper {
@@ -902,6 +930,7 @@ mod vulkan {
                             *i, 
                             swapchain_format,
                             vk::ImageAspectFlags::COLOR,
+                            1,
                         )
                         // SwapchainWrapper::create_image_view(swapchain_format, logical_device, *i, vk::ImageAspectFlags::COLOR)
                     })
@@ -1187,7 +1216,7 @@ mod vulkan {
                 
             let multisample_state = {vk::PipelineMultisampleStateCreateInfo::builder()
                 .sample_shading_enable(false)
-                .rasterization_samples(vk::SampleCountFlags::_1)
+                .rasterization_samples(device.msaa_samples)
             };
 
             let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::builder()
@@ -1200,10 +1229,15 @@ mod vulkan {
                 .stencil_test_enable(false);
                 // .front and .back required for use of stencil
 
-            let attachment = {vk::PipelineColorBlendAttachmentState::builder()
+            let attachment = vk::PipelineColorBlendAttachmentState::builder()
                 .color_write_mask(vk::ColorComponentFlags::all())
-                .blend_enable(false)
-            };
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+                .alpha_blend_op(vk::BlendOp::ADD);
 
             let attachments = &[attachment];
             let color_blend_state = {vk::PipelineColorBlendStateCreateInfo::builder()
@@ -1213,10 +1247,23 @@ mod vulkan {
                 .blend_constants([0.0, 0.0, 0.0, 0.0])
             };
             
-            let pipeline_layout ={
+            let pipeline_layout = {
+                let vert_push_constant_range = vk::PushConstantRange::builder()
+                    .stage_flags(vk::ShaderStageFlags::VERTEX)
+                    .offset(0)
+                    .size(64);
+
+                let frag_push_constant_range = vk::PushConstantRange::builder()
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                    .offset(64)
+                    .size(4);
+
                 let set_layouts = &[**descriptor_set_layout];
+                let push_constant_ranges = &[vert_push_constant_range, frag_push_constant_range];
                 let layout_info = vk::PipelineLayoutCreateInfo::builder()
-                    .set_layouts(set_layouts);
+                    .set_layouts(set_layouts)
+                    .push_constant_ranges(push_constant_ranges);
+
                 unsafe {
                     logical_device.create_pipeline_layout(&layout_info, None)?
                 }
@@ -1228,23 +1275,34 @@ mod vulkan {
                 // Attachments
                 let color_attachment = vk::AttachmentDescription::builder()
                     .format(swapchain_format)
-                    .samples(vk::SampleCountFlags::_1)
+                    .samples(device.msaa_samples)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
                 let depth_stencil_attachment = vk::AttachmentDescription::builder()
                     .format(DepthImageWrapper::get_depth_format(&device, instance)?)
-                    .samples(vk::SampleCountFlags::_1)
+                    .samples(device.msaa_samples)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(vk::ImageLayout::UNDEFINED)
                     .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+                // Resolve the initial multisampled attachment to habe sample count of 1
+                let color_reolve_attachment = vk::AttachmentDescription::builder()
+                    .format(swapchain_format)
+                    .samples(vk::SampleCountFlags::_1)
+                    .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
 
 
                 // Subpasses
@@ -1259,12 +1317,17 @@ mod vulkan {
                     .attachment(1)
                     .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
+                let color_resolve_attachment_ref = vk::AttachmentReference::builder()
+                    .attachment(2)
+                    .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+                let resolve_attachments = &[color_resolve_attachment_ref];
+
                 let subpass = vk::SubpassDescription::builder()
                     .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
                     .color_attachments(color_attachments)
-                    .depth_stencil_attachment(&depth_stencil_attachment_ref);
-
-                
+                    .depth_stencil_attachment(&depth_stencil_attachment_ref)
+                    .resolve_attachments(resolve_attachments);
 
                 // Dependencies
                 let dependency = vk::SubpassDependency::builder()
@@ -1278,7 +1341,11 @@ mod vulkan {
                     .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                         | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
 
-                let attachments = &[color_attachment, depth_stencil_attachment];
+                let attachments = &[
+                    color_attachment, 
+                    depth_stencil_attachment,
+                    color_reolve_attachment,
+                    ];
                 let subpasses = &[subpass];
                 let dependencies = &[dependency];
                 let info = vk::RenderPassCreateInfo::builder()
@@ -1521,6 +1588,18 @@ mod vulkan {
                 device.allocate_command_buffers(&allocate_info) ?
             };
 
+            let push_model = Mat4::from_axis_angle(
+                vec3(0.0, 0.0, 1.0), 
+                Deg(0.0),
+            );
+
+            let model_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &push_model as *const Mat4 as *const u8, 
+                    size_of::<Mat4>(),
+                )
+            };
+
             for (i, command_buffer) in command_buffers.iter().enumerate() {
                 let inheritance = vk::CommandBufferInheritanceInfo::builder();
 
@@ -1568,6 +1647,20 @@ mod vulkan {
                         0, 
                         &[descriptor_sets.descriptor_sets[i]], 
                         &[]
+                    );
+                    device.cmd_push_constants(
+                        *command_buffer, 
+                        pipeline.pipeline_layout, 
+                        vk::ShaderStageFlags::VERTEX, 
+                        0,
+                        model_bytes,
+                    );
+                    device.cmd_push_constants(
+                        *command_buffer, 
+                        pipeline.pipeline_layout, 
+                        vk::ShaderStageFlags::FRAGMENT, 
+                        64, 
+                        &0.25f32.to_ne_bytes()[..],
                     );
                     device.cmd_draw_indexed(*command_buffer, model.indices.len() as u32, 1, 0, 0, 0);
                     device.cmd_end_render_pass(*command_buffer);
@@ -1773,7 +1866,6 @@ mod vulkan {
     #[repr(C)]
     #[derive(Copy, Clone, Debug)]
     struct  UniformBufferObject {
-        model: Mat4,
         view: Mat4,
         proj: Mat4,
     }
@@ -2026,6 +2118,7 @@ mod vulkan {
         indices: Indices,
         index_buffer: IndexBuffer,
         vertex_buffer: VertexBuffer,
+        mip_levels: u32,
     }
 
     type Vertices = Vec<Vertex>;
@@ -2053,6 +2146,7 @@ mod vulkan {
 
             let size = reader.info().raw_bytes() as u64;
             let (width, height) = reader.info().size();
+            let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
 
             if width != 1024 || height != 1024 || reader.info().color_type != png::ColorType::Rgba {
                 return Err(anyhow!("Invalid texture image"));
@@ -2069,7 +2163,7 @@ mod vulkan {
                     vk::BufferUsageFlags::TRANSFER_SRC
                 )?;
 
-            // Create (Image)
+            // Copy (staging)
 
             let memory = unsafe {
                 device.map_memory(
@@ -2086,6 +2180,8 @@ mod vulkan {
                 device.unmap_memory(staging_buffer.buffer_memory);
             }
 
+            // Create (Image)
+
             let mut image = ImageWrapper::new(
                 instance, 
                 device.clone(), 
@@ -2093,19 +2189,23 @@ mod vulkan {
                 height, 
                 vk::Format::R8G8B8A8_SRGB, 
                 vk::ImageTiling::OPTIMAL, 
-                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, 
+                vk::ImageUsageFlags::SAMPLED 
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 vk::ImageAspectFlags::COLOR,
+                mip_levels,
+                vk::SampleCountFlags::_1,
             )?;
-            
 
             // Transition + Copy (Image)
 
             image.transition_layout(
                 command_pool, 
-                vk::Format::R8G8B8A8_SRGB, 
+                // vk::Format::R8G8B8A8_SRGB, 
                 vk::ImageLayout::UNDEFINED, 
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                mip_levels,
             )?;
 
             image.copy_buffer_to_image(
@@ -2115,17 +2215,34 @@ mod vulkan {
                 width, 
                 height,
             )?;
+            
+            Model::generate_mipmaps(
+                instance, 
+                &device, 
+                command_pool, 
+                &image,
+                vk::Format::R8G8B8A8_SRGB, 
+                width, 
+                height, 
+                mip_levels
+            )?;
 
+            
+            /*
             image.transition_layout(
                 command_pool, 
                 vk::Format::R8G8B8A8_SRGB, 
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL, 
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             )?;
+            */
 
-            let sampler = SamplerWrapper::new(device.clone())?;
+            let sampler = SamplerWrapper::new(device.clone(), mip_levels)?;
+
             
-            Ok(Self { image, sampler, vertex_buffer, index_buffer, vertices, indices })
+
+            
+            Ok(Self { image, sampler, vertex_buffer, index_buffer, vertices, indices, mip_levels })
         }
 
         fn load_model(
@@ -2176,6 +2293,166 @@ mod vulkan {
             }
 
             Ok((vertices, indices))
+        }
+    
+        fn generate_mipmaps(
+            instance: &InstanceWrapper,
+            device: &Arc<DeviceWrapper>,
+            command_pool: &CommandPoolWrapper,
+            image: &ImageWrapper,
+            format: vk::Format,
+            width: u32,
+            height: u32,
+            mip_levels: u32,
+        ) -> Result<()> {
+
+            if unsafe {
+                !instance
+                .get_physical_device_format_properties(device.physical_device, format)
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)}
+            {
+                return Err(anyhow!("Texture image format does not support linear blitting"));
+            }
+
+            let mut command_buffer = unsafe {
+                OneTimeCommand::new(device.clone(), command_pool)?
+            };
+
+            let subresource = vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0)
+                .layer_count(1)
+                .level_count(1);
+
+            let mut barrier = vk::ImageMemoryBarrier::builder()
+                .image(image.image)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(subresource);
+
+            let mut mip_width = width;
+            let mut mip_height = height;
+
+            // Transition each mipmap level individually, from each step to another
+
+            for i in 1..mip_levels {
+                barrier.subresource_range.base_mip_level = i - 1;
+                barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+                barrier.new_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
+                barrier.dst_access_mask = vk::AccessFlags::TRANSFER_READ;
+
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command_buffer.command_buffer, 
+                        vk::PipelineStageFlags::TRANSFER, 
+                        vk::PipelineStageFlags::TRANSFER, 
+                        vk::DependencyFlags::empty(), 
+                        &[] as &[vk::MemoryBarrier], 
+                        &[] as &[vk::BufferMemoryBarrier], 
+                        &[barrier],
+                    );
+                }
+
+                let src_subresource = vk::ImageSubresourceLayers::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(i - 1)
+                    .base_array_layer(0)
+                    .layer_count(1);
+
+                let dst_subresource = vk::ImageSubresourceLayers::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(i)
+                    .base_array_layer(0)
+                    .layer_count(1);
+
+                let blit = vk::ImageBlit::builder()
+                    .src_offsets([
+                        vk::Offset3D {x: 0, y: 0, z: 0},
+                        vk::Offset3D {
+                            x: mip_width as i32,
+                            y: mip_height as i32,
+                            z: 1,
+                        },
+                    ])
+                    .src_subresource(src_subresource)
+                    .dst_offsets([
+                        vk::Offset3D {x: 0, y: 0, z: 0},
+                        vk::Offset3D {
+                            x: (if mip_width > 1 { mip_width / 2 } else { 1 }) as i32,
+                            y: (if mip_height > 1 { mip_height / 2 } else { 1 }) as i32,
+                            z: 1,
+                        },
+                    ])
+                    .dst_subresource(dst_subresource);
+
+                    unsafe {
+                        device.cmd_blit_image(
+                            command_buffer.command_buffer, 
+                            image.image, 
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL, 
+                            image.image, 
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL, 
+                            &[blit],
+                            vk::Filter::LINEAR,
+                        );
+                    }
+
+                    barrier.old_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                    barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                    barrier.src_access_mask = vk::AccessFlags::TRANSFER_READ;
+                    barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+
+                    unsafe {
+                        device.cmd_pipeline_barrier(
+                            command_buffer.command_buffer, 
+                            vk::PipelineStageFlags::TRANSFER, 
+                            vk::PipelineStageFlags::FRAGMENT_SHADER, 
+                            vk::DependencyFlags::empty(), 
+                            &[] as &[vk::MemoryBarrier], 
+                            &[] as &[vk::BufferMemoryBarrier], 
+                            &[barrier],
+                            
+                        );
+                    }
+
+                    if mip_width > 1 {
+                        mip_width /= 2;
+                    }
+
+                    if mip_height > 1 {
+                        mip_height /= 2;
+                    }
+
+                    
+            }
+
+            barrier.subresource_range.base_mip_level = mip_levels - 1;
+            barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+            barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
+            barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer.command_buffer, 
+                    vk::PipelineStageFlags::TRANSFER, 
+                    vk::PipelineStageFlags::FRAGMENT_SHADER, 
+                    vk::DependencyFlags::empty(), 
+                    &[] as &[vk::MemoryBarrier], 
+                    &[] as &[vk::BufferMemoryBarrier], 
+                    &[barrier],
+                    
+                );
+            }
+
+            unsafe {
+                command_buffer.end(command_pool)?;
+            }
+                
+            Ok(())
+
         }
     }
 
@@ -2244,6 +2521,8 @@ mod vulkan {
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, 
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 vk::ImageAspectFlags::COLOR,
+                1,
+                vk::SampleCountFlags::_1,
             )?;
             
 
@@ -2251,9 +2530,10 @@ mod vulkan {
 
             image.transition_layout(
                 command_pool, 
-                vk::Format::R8G8B8A8_SRGB, 
+                // vk::Format::R8G8B8A8_SRGB, 
                 vk::ImageLayout::UNDEFINED, 
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                1,
             )?;
 
             image.copy_buffer_to_image(
@@ -2266,12 +2546,13 @@ mod vulkan {
 
             image.transition_layout(
                 command_pool, 
-                vk::Format::R8G8B8A8_SRGB, 
+                // vk::Format::R8G8B8A8_SRGB, 
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL, 
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                1,
             )?;
 
-            let sampler = SamplerWrapper::new(device.clone())?;
+            let sampler = SamplerWrapper::new(device.clone(), 1)?;
             
             Ok(Self { image, sampler, vertex_buffer, index_buffer })
         }
@@ -2302,6 +2583,8 @@ mod vulkan {
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, 
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 vk::ImageAspectFlags::DEPTH,
+                1,
+                device.msaa_samples,
             )?;
 
             let depth_image_view = ImageViewWrapper::new(
@@ -2309,6 +2592,7 @@ mod vulkan {
                 depth_image.image, 
                 format,
                 vk::ImageAspectFlags::DEPTH,
+                1
             )?;
 
 
@@ -2364,6 +2648,46 @@ mod vulkan {
 
     }
     
+    struct ColorImageWrapper {
+        color_image: ImageWrapper,
+        color_image_view: ImageViewWrapper,
+    }
+
+    impl ColorImageWrapper {
+        fn new(
+            instance: &InstanceWrapper,
+            device: Arc<DeviceWrapper>,
+            swapchain: &SwapchainWrapper,
+            // samples: vk::SampleCountFlags,
+        ) -> Result<Self> {
+            
+            let color_image = ImageWrapper::new(
+                instance, 
+                device.clone(), 
+                swapchain.swapchain_extent.width, 
+                swapchain.swapchain_extent.height, 
+                swapchain.swapchain_format, 
+                vk::ImageTiling::OPTIMAL, 
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT, 
+                vk::MemoryPropertyFlags::DEVICE_LOCAL, 
+                vk::ImageAspectFlags::COLOR, 
+                1, 
+                device.msaa_samples,
+            )?;
+
+            let color_image_view = ImageViewWrapper::new(
+                device, 
+                color_image.image, 
+                swapchain.swapchain_format, 
+                vk::ImageAspectFlags::COLOR, 
+                1,
+            )?;
+
+            Ok(Self { color_image, color_image_view })
+        }
+    }
+
     struct ImageWrapper {
         image: vk::Image,
         image_memory: vk::DeviceMemory,
@@ -2382,19 +2706,21 @@ mod vulkan {
             usage: vk::ImageUsageFlags,
             properties: vk::MemoryPropertyFlags,
             aspects: vk::ImageAspectFlags,
+            mip_levels: u32,
+            samples: vk::SampleCountFlags,
         ) -> Result<Self> {
             let image = unsafe {
                 let info = vk::ImageCreateInfo::builder()
                 .image_type(vk::ImageType::_2D)
                 .extent(vk::Extent3D {width, height, depth: 1})
-                .mip_levels(1)
+                .mip_levels(mip_levels)
                 .array_layers(1)
                 .format(format)
                 .tiling(tiling)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
                 .usage(usage)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .samples(vk::SampleCountFlags::_1)
+                .samples(samples)
                 .flags(vk::ImageCreateFlags::empty());
 
                 device.create_image(&info, None)? 
@@ -2424,6 +2750,7 @@ mod vulkan {
                 image, 
                 format,
                 aspects,
+                mip_levels,
             )?;
 
             Ok(Self { image, image_memory, image_view, device })
@@ -2433,9 +2760,10 @@ mod vulkan {
         fn transition_layout(
             &mut self,
             command_pool: &CommandPoolWrapper,
-            format: vk::Format,
+            // format: vk::Format,
             old_layout: vk::ImageLayout,
             new_layout: vk::ImageLayout,
+            mip_levels: u32,
         ) -> Result<()> {
 
             let (
@@ -2466,7 +2794,7 @@ mod vulkan {
             let subresource = vk::ImageSubresourceRange::builder()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(0)
-                .level_count(1)
+                .level_count(mip_levels)
                 .base_array_layer(0)
                 .layer_count(1);
 
@@ -2564,11 +2892,12 @@ mod vulkan {
             image: vk::Image,
             format: vk::Format,
             aspects: vk::ImageAspectFlags,
+            mip_levels: u32,
         ) -> Result<Self> {
             let subresource_range = vk::ImageSubresourceRange::builder()
                 .aspect_mask(aspects)
                 .base_mip_level(0)
-                .level_count(1)
+                .level_count(mip_levels)
                 .base_array_layer(0)
                 .layer_count(1);
 
@@ -2603,6 +2932,7 @@ mod vulkan {
     impl SamplerWrapper {
         fn new(
             device: Arc<DeviceWrapper>, 
+            mip_levels: u32,
         ) -> Result<Self> {
             let info = vk::SamplerCreateInfo::builder()
                 .mag_filter(vk::Filter::LINEAR)
@@ -2618,7 +2948,8 @@ mod vulkan {
                 .compare_op(vk::CompareOp::ALWAYS)
                 .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
                 .mip_lod_bias(0.0)
-                .min_lod(0.0);
+                .min_lod(0.0)
+                .max_lod(mip_levels as f32);
 
             let sampler = unsafe {
                 device.create_sampler(&info, None)?

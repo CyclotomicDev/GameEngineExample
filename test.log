@@ -1,6 +1,6 @@
-[00:00:00.083] (6bc0) INFO   Window successfully created
-[00:00:11.563] (6bc0) WARN   Skipping physical device (`Intel(R) Iris(R) Xe Graphics`): Missing Only discrete GPUs are supported
-[00:00:11.585] (6bc0) INFO   Selected physical device (`NVIDIA GeForce RTX 3070 Ti Laptop GPU`)
-[00:00:22.597] (6bc0) INFO   Window close requested
-[00:00:22.602] (6bc0) INFO   Main loop exited
-[00:00:22.753] (6bc0) INFO   Before instance destroyed
+[00:00:00.083] (66a8) INFO   Window successfully created
+[00:00:11.759] (66a8) WARN   Skipping physical device (`Intel(R) Iris(R) Xe Graphics`): Missing Only discrete GPUs are supported
+[00:00:11.776] (66a8) INFO   Selected physical device (`NVIDIA GeForce RTX 3070 Ti Laptop GPU`)
+[00:00:25.684] (66a8) INFO   Window close requested
+[00:00:25.685] (66a8) INFO   Main loop exited
+[00:00:26.061] (66a8) INFO   Before instance destroyed
