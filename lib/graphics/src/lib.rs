@@ -116,12 +116,13 @@ mod vulkan {
         recreate: Option<RecreateWrapper>, // Handles objects that may be recreated
         model: Model,
         //texture: TextureImageWrapper,
+        frames: Vec<Frame>,
         descriptor_set_layout: DescriptorSetLayoutWrapper,
         command_pool: CommandPoolWrapper,
         device: Arc<DeviceWrapper>, // Destroyed after all other objects
         instance: InstanceWrapper, // Destroyed after device
         
-        frame: usize,
+        current_frame: usize,
         resized: bool,
         start: Instant,
     }
@@ -133,101 +134,123 @@ mod vulkan {
             let command_pool = CommandPoolWrapper::new(&instance, device.clone())?;
             let descriptor_set_layout = DescriptorSetLayoutWrapper::new(device.clone())?;
             // let texture = TextureImageWrapper::new(&instance, device.clone(), &command_pool)?;
+
+            let frames = (0..MAX_FRAMES_IN_FLIGHT)
+                .map(|_| Frame::new(&instance, device.clone()))
+                .collect::<Result<Vec<Frame>>>()?;
+
             let model = Model::new(&instance, device.clone(), &command_pool)?;
             let recreate = Some(RecreateWrapper::new(device.clone(), &instance, window, &command_pool, &descriptor_set_layout, &model)?);
 
-            Ok(Self {instance, device, frame: 0, resized: false, recreate, command_pool, descriptor_set_layout, start: Instant::now(), model})
+            Ok(Self {instance, device, frames, resized: false, recreate, command_pool, descriptor_set_layout, start: Instant::now(), model, current_frame: 0})
         }
 
         pub fn render(&mut self, window: &Window) -> Result<()> {
-            let recreate = self.recreate.as_mut().ok_or(anyhow!("Recreate missing"))?;
-            let logical_device = &self.device.logical_device;
-            let image_available_semaphores = &recreate.command.image_available_semaphores;
-            let render_finsished_semaphores = &recreate.command.render_finished_semaphores;
-            let in_flight_fences = &recreate.command.in_flight_fences;
-            let images_in_flight = &mut recreate.command.images_in_flight;
-            let frame = self.frame;
 
-            // Wait for other frames to be completed; safety: both device and in_flight_fences created
+
+            let recreate = self.recreate.as_mut().ok_or(anyhow!("Recreate missing"))?;
+ 
+            // Wait for work on previous frame in slot to be completed
+
+            
             unsafe {
                 self.device.logical_device.wait_for_fences(
-                    &[in_flight_fences[frame]], 
+                    &[self.frames[self.current_frame].fence], 
                     true, 
                     u64::MAX,
                 )?
             };
 
-            // 1. Aquire image from swapchain
+            // Reset frame resources
+
+            self.frames[self.current_frame].reset()?;
+            
 
             
+
+            // Aquire image from swapchain
+
             let result = unsafe {
-                logical_device.acquire_next_image_khr(
+                self.device.acquire_next_image_khr(
                     recreate.swapchain.swapchain, 
-                    u64::MAX, 
-                    recreate.command.image_available_semaphores[frame], 
+                    u64::MAX,
+                    self.frames[self.current_frame].image_available_semaphore,
                     vk::Fence::null()
                 )
             };
 
             // Check if swapchain needs to be recreated (e.g. window resize)
+
             let image_index = match result {
                 Ok((image_index, _)) => image_index as usize,
                 Err(vk::ErrorCode::OUT_OF_DATE_KHR) => return  self.recreate_swapchain(window),
                 Err(e) => return  Err(anyhow!(e)),
             };
+            // Wait for previous image in same swapchain index to be finished
 
-            // Safety: Each fence must not be currently associated with any queue command that has not completed execution
-            unsafe {
-                logical_device.reset_fences(&[in_flight_fences[frame]])?
-            };
+            let image_in_flight = recreate.swapchain.swapchain_fences[self.current_frame];
 
 
-            let swapchain = recreate.swapchain.swapchain;
-
-
-
-            if !images_in_flight[image_index].is_null() {
+            if !image_in_flight.is_null() {
                 unsafe {
-                    logical_device.wait_for_fences(
-                        &[images_in_flight[image_index]],
+                    self.device.wait_for_fences(
+                        &[image_in_flight],
                         true, 
                         u64::MAX,
                     )?;
                 }
             }
 
-            images_in_flight[image_index] = in_flight_fences[frame];
+            
+
+            // Associate swapchain with current frame
+
+            recreate.swapchain.swapchain_fences[image_index] = self.frames[self.current_frame].fence;
+
+            // Update push constants and unifornm buffer
+
+            recreate.framebuffers[image_index].update(&recreate.swapchain, &recreate.pipeline, &recreate.descriptor_sets ,&self.model, image_index, self.start, &self.frames[self.current_frame])?;
 
             VulkanHandler::update_uniform_buffer(self.start.elapsed().as_secs_f32(), self.device.clone(), &recreate.uniform_buffers.buffers[image_index], &recreate.swapchain)?;
 
-            // 2. Execute command buffer with image as attachment in the framebuffer
+            // Execute command buffer with image as attachment in the framebuffer
 
-            let wait_semaphores = &[image_available_semaphores[self.frame]];
-            let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let command_buffers = &[recreate.command.command_buffers[image_index as usize]];
-            let signal_semaphores = &[render_finsished_semaphores[self.frame]];
-            let submit_info = vk::SubmitInfo::builder()
-                .wait_semaphores(wait_semaphores)
-                .wait_dst_stage_mask(wait_stages)
-                .command_buffers(command_buffers)
-                .signal_semaphores(signal_semaphores);
+            
+            let signal_semaphores = &[self.frames[self.current_frame].render_finished_semaphore];
 
-            unsafe {
-                self.device.logical_device.queue_submit(
-                    self.device.graphics_queue, 
-                    &[submit_info], 
-                    in_flight_fences[self.frame])?  
-            };
+            {
+                let wait_semaphores = &[self.frames[self.current_frame].image_available_semaphore];
+                let wait_stages = &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let command_buffers = &[self.frames[self.current_frame].command_buffers[0]];
+                let submit_info = vk::SubmitInfo::builder()
+                    .wait_semaphores(wait_semaphores)
+                    .wait_dst_stage_mask(wait_stages)
+                    .command_buffers(command_buffers)
+                    .signal_semaphores(signal_semaphores);
 
-            let swapchains = &[swapchain];
-            let image_indices = &[image_index as u32];
-            let present_info = vk::PresentInfoKHR::builder()
-                .wait_semaphores(signal_semaphores)
-                .swapchains(swapchains)
-                .image_indices(image_indices);
+                unsafe {
+                    self.device.reset_fences(&[self.frames[self.current_frame].fence])?;
+                };
 
-            let result = unsafe {
-                self.device.logical_device.queue_present_khr(self.device.present_queue, &present_info)
+                unsafe {
+                    self.device.logical_device.queue_submit(
+                        self.device.graphics_queue, 
+                        &[submit_info], 
+                        self.frames[self.current_frame].fence)?  
+                };
+            }
+
+            let result = {
+                let swapchains = &[recreate.swapchain.swapchain];
+                let image_indices = &[image_index as u32];
+                let present_info = vk::PresentInfoKHR::builder()
+                    .wait_semaphores(signal_semaphores)
+                    .swapchains(swapchains)
+                    .image_indices(image_indices);
+
+                unsafe {
+                    self.device.queue_present_khr(self.device.present_queue, &present_info)
+                }
             };
 
             // Handled after queue_present_khr to ensure semaphores in consitent state
@@ -241,8 +264,10 @@ mod vulkan {
                 return Err(anyhow!(e));
             }
 
+
+
             // Advance to next frame
-            self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
+            self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
             Ok(())
         }
@@ -330,10 +355,12 @@ mod vulkan {
     struct RecreateWrapper {
         depth_image: DepthImageWrapper,
         color_image: ColorImageWrapper,
-        command: CommandWrapper,
-        framebuffers: Vec<vk::Framebuffer>,
+        // command: CommandWrapper,
+        // framebuffers: Vec<vk::Framebuffer>,
+        framebuffers: Vec<FramebufferWrapper>,
         uniform_buffers: UniformBuffers,
         descriptor_pool: DescriptorPoolWrapper,
+        descriptor_sets: DescriptorSetsWrapper,
         pipeline: PipelineWrapper,
         swapchain: SwapchainWrapper,
         device: Arc<DeviceWrapper>,
@@ -358,11 +385,13 @@ mod vulkan {
             let pipeline = PipelineWrapper::new(device.clone(), swapchain.swapchain_extent, swapchain.swapchain_format, descriptor_set_layout, instance)?;
             let descriptor_pool = DescriptorPoolWrapper::new(device.clone(), &swapchain)?;
             let descriptor_sets = DescriptorSetsWrapper::new(device.clone(), descriptor_set_layout, &descriptor_pool, &swapchain, &uniform_buffers, model)?;
-            let framebuffers = RecreateWrapper::create_framebuffers(&**device, &swapchain, &pipeline.render_pass, &depth_image, &color_image)?;
-            let mut command = CommandWrapper::new(&instance, device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, &descriptor_sets, &model)?;
-            command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
+            let framebuffers = (0..swapchain.swapchain_images.len())
+                .map(|i| FramebufferWrapper::new(device.clone(), &swapchain, &pipeline.render_pass, &depth_image, &color_image, i))
+                .collect::<Result<Vec<_>>>()?;
+            // let mut command = CommandWrapper::new(device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, &descriptor_sets, &model)?;
+            // command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
 
-            Ok(Self { command, framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool, depth_image, color_image })
+            Ok(Self {framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool, depth_image, color_image, descriptor_sets })
         }
 
         fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass, depth_image: &DepthImageWrapper, color_image: &ColorImageWrapper) -> Result<Vec<vk::Framebuffer>> {
@@ -385,16 +414,6 @@ mod vulkan {
                 .collect::<Result<Vec<_>, _>>()?;
 
             Ok(framebuffers)
-        }
-    }
-
-    impl Drop for RecreateWrapper {
-        fn drop(&mut self) {
-            unsafe {
-                self.framebuffers
-                    .iter()
-                    .for_each(|f| self.device.destroy_framebuffer(*f, None));
-            }
         }
     }
 
@@ -851,11 +870,14 @@ mod vulkan {
         swapchain: vk::SwapchainKHR,
         swapchain_images: Vec<vk::Image>,
         swapchain_image_views: Vec<ImageViewWrapper>,
-        device: Arc<DeviceWrapper>
+        swapchain_fences: Vec<vk::Fence>,
+        device: Arc<DeviceWrapper>,
     }
 
     impl SwapchainWrapper {
         fn new(instance: &InstanceWrapper, device: Arc<DeviceWrapper>, window: &Window) -> Result<Self> {
+
+            info!("Swapchain recreated");
 
             let physical_device = device.physical_device;
 
@@ -918,7 +940,11 @@ mod vulkan {
 
             let swapchain_image_views = SwapchainWrapper::create_swapchain_image_views(surface_format.format, &swapchain_images, &device)?;
 
-            Ok(Self { swapchain_format: surface_format.format, swapchain_extent, swapchain, swapchain_images, swapchain_image_views, device })
+            let swapchain_fences = (0..swapchain_images.len())
+                .map(|_| vk::Fence::null())
+                .collect();
+
+            Ok(Self { swapchain_format: surface_format.format, swapchain_extent, swapchain, swapchain_images, swapchain_image_views, swapchain_fences, device })
         }
 
         fn create_swapchain_image_views(swapchain_format: vk::Format, swapchain_images: &Vec<vk::Image>, device: &Arc<DeviceWrapper>) -> Result<Vec<ImageViewWrapper>> {
@@ -971,11 +997,99 @@ mod vulkan {
         fn drop(&mut self) {
             unsafe {
                 /*
-                self.swapchain_image_views
-                    .iter()
-                    .for_each(|v| self.device.destroy_image_view(*v, None));
+                self.swapchain_fences
+                    .drain(..)
+                    .for_each(|f| self.device.destroy_fence(f, None));
                 */
+
                 self.device.destroy_swapchain_khr(self.swapchain, None);
+            }
+        }
+    }
+
+    // Holds all resources rquired per frame
+    struct Frame {
+        command_pool: vk::CommandPool,
+        command_buffers: Vec<vk::CommandBuffer>,
+
+        // Semaphores to control GPU syncronization
+        image_available_semaphore: vk::Semaphore,
+        render_finished_semaphore: vk::Semaphore,
+
+        // Fences to control CPU syncronization
+        fence: vk::Fence,
+        
+        device: Arc<DeviceWrapper>,
+    }
+    
+    impl Frame {
+        fn new(
+            instance: &InstanceWrapper,
+            device: Arc<DeviceWrapper>,
+        ) -> Result<Self>
+        {
+            let command_pool = {
+                let indices = QueueFamilyIndices::new(instance, device.physical_device)?;
+
+                let info = vk::CommandPoolCreateInfo::builder()
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+                    .queue_family_index(indices.graphics);
+
+                unsafe {
+                    device.create_command_pool(&info, None)?
+                }
+            };
+
+            let command_buffers = {
+                let allocate_info = vk::CommandBufferAllocateInfo::builder()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1);
+
+                unsafe {
+                    device.allocate_command_buffers(&allocate_info)?
+                }
+            };
+
+            let (image_available_semaphore, render_finished_semaphore, fence) = unsafe {
+                let semaphore_info = vk::SemaphoreCreateInfo::builder();
+                let fence_info = vk::FenceCreateInfo::builder()
+                    .flags(vk::FenceCreateFlags::SIGNALED); // Want to have fences appear as if just complete frame at start rather than causing wait for non-existant frame
+
+                let image_available_semaphore = device.create_semaphore(&semaphore_info, None)?;
+
+                let render_finished_semaphore = device.create_semaphore(&semaphore_info, None)?;
+            
+                let in_flight_fence = device.create_fence(&fence_info, None)?;
+                
+                (image_available_semaphore, render_finished_semaphore, in_flight_fence)
+            };
+
+            Ok(Self { command_pool, command_buffers, image_available_semaphore, render_finished_semaphore, fence, device })
+        }
+
+        fn reset(
+            &mut self
+        ) -> Result<()> {
+            unsafe {
+                self.device.reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::RELEASE_RESOURCES)?;
+            }
+
+            Ok(())
+        }
+    }
+
+
+    impl Drop for Frame {
+        fn drop(&mut self) {
+            unsafe {
+                self.device.destroy_semaphore(self.image_available_semaphore, None);
+                self.device.destroy_semaphore(self.render_finished_semaphore, None);
+
+                self.device.destroy_fence(self.fence, None);
+
+                self.device.free_command_buffers(self.command_pool, &self.command_buffers);
+                self.device.destroy_command_pool(self.command_pool, None);
             }
         }
     }
@@ -1453,6 +1567,7 @@ mod vulkan {
         }
     }
 
+    // 
     struct CommandPoolWrapper {
         command_pool: vk::CommandPool,
         device: Arc<DeviceWrapper>,
@@ -1463,7 +1578,7 @@ mod vulkan {
             let indices = QueueFamilyIndices::new(instance, device.physical_device)?;
 
             let info = vk::CommandPoolCreateInfo::builder()
-                .flags(vk::CommandPoolCreateFlags::empty())
+                // .flags(vk::CommandPoolCreateFlags::TRANSIENT)
                 .queue_family_index(indices.graphics);
 
             let command_pool = unsafe {
@@ -1471,15 +1586,6 @@ mod vulkan {
             };
 
             Ok(Self { command_pool, device })
-        }
-
-        fn reset(&mut self) -> Result<()> {
-            unsafe {
-                self.device.reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::RELEASE_RESOURCES)?;
-
-            }
-
-            Ok(())
         }
 
     }
@@ -1506,91 +1612,68 @@ mod vulkan {
         }
     }
 
-    struct CommandWrapper {
-        command_buffers: Vec<vk::CommandBuffer>,
-        // Semaphores to control GPU syncronization
-        image_available_semaphores: Vec<vk::Semaphore>,
-        render_finished_semaphores: Vec<vk::Semaphore>,
-        // Fences to control CPU syncronization
-        in_flight_fences: Vec<vk::Fence>,
-        images_in_flight: Vec<vk::Fence>,
+    struct FramebufferWrapper {
+        framebuffer: vk::Framebuffer,
         device: Arc<DeviceWrapper>,
     }
 
-    impl CommandWrapper {
-        fn new(instance: &InstanceWrapper, 
-               device: Arc<DeviceWrapper>,
-               command_pool: &CommandPoolWrapper,
-               framebuffers: &Vec<vk::Framebuffer>, 
-               swapchain: &SwapchainWrapper, 
-               pipeline: &PipelineWrapper, 
-               descriptor_sets: &DescriptorSetsWrapper,
-               model: &Model,
+    impl FramebufferWrapper {
+        fn new(
+            device: Arc<DeviceWrapper>,
+            swapchain: &SwapchainWrapper,
+            render_pass: &vk::RenderPass, 
+            depth_image: &DepthImageWrapper, 
+            color_image: &ColorImageWrapper,
+            index: usize,
         ) -> Result<Self> {
-            let command_buffers  = CommandWrapper::create_command_buffers(
-                &*device, 
-                **command_pool, 
-                framebuffers, 
-                swapchain, 
-                pipeline, 
-                descriptor_sets,
-                model,
-            )?;
+            
+            let framebuffer = {
+                let attachments = &[color_image.color_image_view.image_view, depth_image.depth_image_view.image_view, swapchain.swapchain_image_views[index].image_view];
+                let create_info = vk::FramebufferCreateInfo::builder()
+                    .render_pass(*render_pass)
+                    .attachments(attachments)
+                    .width(swapchain.swapchain_extent.width)
+                    .height(swapchain.swapchain_extent.height)
+                    .layers(1);
 
-            let (image_available_semaphores, render_finished_semaphores, in_flight_fences) = unsafe {
-                let semaphore_info = vk::SemaphoreCreateInfo::builder();
-                let fence_info = vk::FenceCreateInfo::builder()
-                    .flags(vk::FenceCreateFlags::SIGNALED); // Want to have fences appear as if just complete frame at start rather than causing wait for non-existant frame
-
-                let mut image_available_semaphores = Vec::new();
-                let mut render_finished_semaphores = Vec::new();
-
-                let mut in_flight_fences = Vec::new();
-
-                for _ in 0..MAX_FRAMES_IN_FLIGHT {
-                    image_available_semaphores
-                        .push(device.create_semaphore(&semaphore_info, None)?);
-                    render_finished_semaphores
-                        .push(device.create_semaphore(&semaphore_info, None)?);
-                
-                    in_flight_fences
-                        .push(device.create_fence(&fence_info, None)?);
+                unsafe {
+                    device.create_framebuffer(&create_info, None)?
                 }
-
-                (image_available_semaphores, render_finished_semaphores, in_flight_fences)
             };
+            
 
-            let images_in_flight = swapchain.swapchain_images
-                .iter()
-                .map(|_| vk::Fence::null())
-                .collect();
-
-            Ok(Self { command_buffers, image_available_semaphores, render_finished_semaphores, in_flight_fences, images_in_flight, device })
+            Ok(Self { framebuffer, device })
         }
 
-        
-    
-        fn create_command_buffers(
-            device: &DeviceWrapper, 
-            command_pool: vk::CommandPool, 
-            framebuffers: &Vec<vk::Framebuffer>, 
+        fn update(
+            &mut self,
             swapchain: &SwapchainWrapper, 
             pipeline: &PipelineWrapper,
             descriptor_sets: &DescriptorSetsWrapper,
             model: &Model,
-        ) -> Result<Vec<vk::CommandBuffer>> {
-            let allocate_info = vk::CommandBufferAllocateInfo::builder()
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(framebuffers.len() as u32);
+            image_index: usize,
+            start: Instant,
+            frame: &Frame,
+        ) -> Result<()> {
 
-            let command_buffers = unsafe {
-                device.allocate_command_buffers(&allocate_info) ?
-            };
+            
+
+            let command_buffer = frame.command_buffers[0];
+
+            /*
+            unsafe {
+                self.device.reset_command_buffer(
+                    command_buffer, 
+                    vk::CommandBufferResetFlags::empty()
+                )?;
+            }
+            */
+
+            let time = start.elapsed().as_secs_f32();
 
             let push_model = Mat4::from_axis_angle(
                 vec3(0.0, 0.0, 1.0), 
-                Deg(0.0),
+                Deg(90.0) * time,
             );
 
             let model_bytes = unsafe {
@@ -1600,100 +1683,80 @@ mod vulkan {
                 )
             };
 
-            for (i, command_buffer) in command_buffers.iter().enumerate() {
-                let inheritance = vk::CommandBufferInheritanceInfo::builder();
+            let info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe {
+                self.device.begin_command_buffer(command_buffer, &info)?
+            };
 
-                let info = vk::CommandBufferBeginInfo::builder()
-                    .flags(vk::CommandBufferUsageFlags::empty())
-                    .inheritance_info(&inheritance);
+            let render_area = vk::Rect2D::builder()
+                .offset(vk::Offset2D::default())
+                .extent(swapchain.swapchain_extent);
 
-                unsafe {
-                    device.begin_command_buffer(*command_buffer, &info)?
-                };
+            let color_clear_value = vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            };
 
-                let render_area = vk::Rect2D::builder()
-                    .offset(vk::Offset2D::default())
-                    .extent(swapchain.swapchain_extent);
+            let depth_clear_value = vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            };
 
-                let color_clear_value = vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 1.0],
-                    },
-                };
+            let clear_values = &[color_clear_value, depth_clear_value];
+            let info = vk::RenderPassBeginInfo::builder()
+                .render_pass(pipeline.render_pass)
+                .framebuffer(self.framebuffer)
+                .render_area(render_area)
+                .clear_values(clear_values);
 
-                let depth_clear_value = vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                };
-
-                let clear_values = &[color_clear_value, depth_clear_value];
-                let info = vk::RenderPassBeginInfo::builder()
-                    .render_pass(pipeline.render_pass)
-                    .framebuffer(framebuffers[i])
-                    .render_area(render_area)
-                    .clear_values(clear_values);
-
-                unsafe {
-                    device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
-                    device.cmd_bind_pipeline(*command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
-                    device.cmd_bind_vertex_buffers(*command_buffer, 0, &[model.vertex_buffer.buffer.buffer], &[0]);
-                    device.cmd_bind_index_buffer(*command_buffer, model.index_buffer.buffer.buffer, 0, vk::IndexType::UINT32);
-                    device.cmd_bind_descriptor_sets(
-                        *command_buffer, 
-                        vk::PipelineBindPoint::GRAPHICS, 
-                        pipeline.pipeline_layout, 
-                        0, 
-                        &[descriptor_sets.descriptor_sets[i]], 
-                        &[]
-                    );
-                    device.cmd_push_constants(
-                        *command_buffer, 
-                        pipeline.pipeline_layout, 
-                        vk::ShaderStageFlags::VERTEX, 
-                        0,
-                        model_bytes,
-                    );
-                    device.cmd_push_constants(
-                        *command_buffer, 
-                        pipeline.pipeline_layout, 
-                        vk::ShaderStageFlags::FRAGMENT, 
-                        64, 
-                        &0.25f32.to_ne_bytes()[..],
-                    );
-                    device.cmd_draw_indexed(*command_buffer, model.indices.len() as u32, 1, 0, 0, 0);
-                    device.cmd_end_render_pass(*command_buffer);
-                    device.end_command_buffer(*command_buffer)?;
-                }
-                
+            unsafe {
+                self.device.cmd_begin_render_pass(command_buffer, &info, vk::SubpassContents::INLINE);
+                self.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
+                self.device.cmd_bind_vertex_buffers(command_buffer, 0, &[model.vertex_buffer.buffer.buffer], &[0]);
+                self.device.cmd_bind_index_buffer(command_buffer, model.index_buffer.buffer.buffer, 0, vk::IndexType::UINT32);
+                self.device.cmd_bind_descriptor_sets(
+                    command_buffer, 
+                    vk::PipelineBindPoint::GRAPHICS, 
+                    pipeline.pipeline_layout, 
+                    0, 
+                    &[descriptor_sets.descriptor_sets[image_index]], 
+                    &[]
+                );
+                self.device.cmd_push_constants(
+                    command_buffer, 
+                    pipeline.pipeline_layout, 
+                    vk::ShaderStageFlags::VERTEX, 
+                    0,
+                    model_bytes,
+                );
+                self.device.cmd_push_constants(
+                    command_buffer, 
+                    pipeline.pipeline_layout, 
+                    vk::ShaderStageFlags::FRAGMENT, 
+                    64, 
+                    &0.25f32.to_ne_bytes()[..],
+                );
+                self.device.cmd_draw_indexed(command_buffer, model.indices.len() as u32, 1, 0, 0, 0);
+                self.device.cmd_end_render_pass(command_buffer);
+                self.device.end_command_buffer(command_buffer)?;
             }
-
-            Ok(command_buffers)
+            
+            Ok(())
         }
-
     }
 
-    impl Drop for CommandWrapper {
+    impl Drop for FramebufferWrapper {
         fn drop(&mut self) {
             unsafe {
-                // Semaphores must match ones created
-                self.render_finished_semaphores
-                    .drain(..)
-                    .for_each(|s| self.device.destroy_semaphore(s, None));
-                self.image_available_semaphores
-                    .drain(..)
-                    .for_each(|s| self.device.destroy_semaphore(s, None));
-                
-                self.in_flight_fences
-                    .drain(..)
-                    .for_each(|f| self.device.destroy_fence(f, None));
-
-                
+                self.device.destroy_framebuffer(self.framebuffer, None);
             }
         }
     }
-    
+
     struct OneTimeCommand {
         command_buffer: vk::CommandBuffer,
         device: Arc<DeviceWrapper>,
