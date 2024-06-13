@@ -33,6 +33,17 @@ impl GraphicsHandler {
         self.minimized = status;
     }
 
+    pub fn inc(&mut self) {
+        if self.vulkan_handler.model_num < 4 {
+            self.vulkan_handler.model_num += 1;
+        }
+    }
+        
+    pub fn dec(&mut self) {
+        if self.vulkan_handler.model_num > 1 {
+            self.vulkan_handler.model_num -= 1;
+        }
+    }
 }
 
 impl Layer for GraphicsHandler {
@@ -68,6 +79,7 @@ mod vulkan {
     use std::fs::File;
 
     const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
 
     
     // Compatibility
@@ -115,7 +127,6 @@ mod vulkan {
     pub struct VulkanHandler {
         recreate: Option<RecreateWrapper>, // Handles objects that may be recreated
         model: Model,
-        //texture: TextureImageWrapper,
         frames: Vec<Frame>,
         descriptor_set_layout: DescriptorSetLayoutWrapper,
         command_pool: CommandPoolWrapper,
@@ -125,6 +136,7 @@ mod vulkan {
         current_frame: usize,
         resized: bool,
         start: Instant,
+        pub model_num: usize,
     }
 
     impl VulkanHandler {
@@ -142,7 +154,7 @@ mod vulkan {
             let model = Model::new(&instance, device.clone(), &command_pool)?;
             let recreate = Some(RecreateWrapper::new(device.clone(), &instance, window, &command_pool, &descriptor_set_layout, &model)?);
 
-            Ok(Self {instance, device, frames, resized: false, recreate, command_pool, descriptor_set_layout, start: Instant::now(), model, current_frame: 0})
+            Ok(Self {instance, device, frames, resized: false, recreate, command_pool, descriptor_set_layout, start: Instant::now(), model, current_frame: 0, model_num: 2})
         }
 
         pub fn render(&mut self, window: &Window) -> Result<()> {
@@ -207,11 +219,13 @@ mod vulkan {
 
             recreate.swapchain.swapchain_fences[image_index] = self.frames[self.current_frame].fence;
 
-            // Update push constants and unifornm buffer
+            // Update push constants and unifornm buffer + render
 
-            recreate.framebuffers[image_index].update(&recreate.swapchain, &recreate.pipeline, &recreate.descriptor_sets ,&self.model, image_index, self.start, &self.frames[self.current_frame])?;
+            // recreate.framebuffers[image_index].update(&recreate.swapchain, &recreate.pipeline, &recreate.descriptor_sets ,&self.model, image_index, self.start, &self.frames[self.current_frame])?;
 
-            VulkanHandler::update_uniform_buffer(self.start.elapsed().as_secs_f32(), self.device.clone(), &recreate.uniform_buffers.buffers[image_index], &recreate.swapchain)?;
+            self.frames[self.current_frame].update(recreate, image_index, self.start, &self.model, self.model_num)?;
+
+            VulkanHandler::update_uniform_buffer( self.device.clone(), &recreate.uniform_buffers.buffers[image_index], &recreate.swapchain)?;
 
             // Execute command buffer with image as attachment in the framebuffer
 
@@ -292,15 +306,10 @@ mod vulkan {
             Ok(())
         }
     
-        fn update_uniform_buffer(time: f32, device: Arc<DeviceWrapper>, buffer: &BufferWrapper, swapchain: &SwapchainWrapper) -> Result<()> {
-
-            let model = Mat4::from_axis_angle(
-                vec3(0.0, 0.0, 1.0), 
-                Deg(90.0) * time
-            );
+        fn update_uniform_buffer(device: Arc<DeviceWrapper>, buffer: &BufferWrapper, swapchain: &SwapchainWrapper) -> Result<()> {
 
             let view = Mat4::look_at_rh(
-                point3(2.0, 2.0, 2.0), 
+                point3(6.0, 0.0, 2.0), 
                 point3(0.0, 0.0, 0.0), 
                 vec3(0.0, 0.0, 1.0),
             );
@@ -355,8 +364,6 @@ mod vulkan {
     struct RecreateWrapper {
         depth_image: DepthImageWrapper,
         color_image: ColorImageWrapper,
-        // command: CommandWrapper,
-        // framebuffers: Vec<vk::Framebuffer>,
         framebuffers: Vec<FramebufferWrapper>,
         uniform_buffers: UniformBuffers,
         descriptor_pool: DescriptorPoolWrapper,
@@ -388,32 +395,9 @@ mod vulkan {
             let framebuffers = (0..swapchain.swapchain_images.len())
                 .map(|i| FramebufferWrapper::new(device.clone(), &swapchain, &pipeline.render_pass, &depth_image, &color_image, i))
                 .collect::<Result<Vec<_>>>()?;
-            // let mut command = CommandWrapper::new(device.clone(), command_pool, &framebuffers, &swapchain, &pipeline, &descriptor_sets, &model)?;
             // command.images_in_flight.resize(swapchain.swapchain_images.len(), vk::Fence::null());
 
             Ok(Self {framebuffers, pipeline, swapchain, device, uniform_buffers, descriptor_pool, depth_image, color_image, descriptor_sets })
-        }
-
-        fn create_framebuffers(logical_device: &Device, swapchain: &SwapchainWrapper, render_pass: &vk::RenderPass, depth_image: &DepthImageWrapper, color_image: &ColorImageWrapper) -> Result<Vec<vk::Framebuffer>> {
-            let framebuffers = 
-                swapchain.swapchain_image_views
-                .iter()
-                .map(|i| {
-                    let attachments = &[color_image.color_image_view.image_view, depth_image.depth_image_view.image_view, i.image_view];
-                    let create_info = vk::FramebufferCreateInfo::builder()
-                        .render_pass(*render_pass)
-                        .attachments(attachments)
-                        .width(swapchain.swapchain_extent.width)
-                        .height(swapchain.swapchain_extent.height)
-                        .layers(1);
-
-                    unsafe {
-                        logical_device.create_framebuffer(&create_info, None)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            Ok(framebuffers)
         }
     }
 
@@ -1011,6 +995,7 @@ mod vulkan {
     struct Frame {
         command_pool: vk::CommandPool,
         command_buffers: Vec<vk::CommandBuffer>,
+        secondary_command_buffers: Vec<vk::CommandBuffer>,
 
         // Semaphores to control GPU syncronization
         image_available_semaphore: vk::Semaphore,
@@ -1065,7 +1050,7 @@ mod vulkan {
                 (image_available_semaphore, render_finished_semaphore, in_flight_fence)
             };
 
-            Ok(Self { command_pool, command_buffers, image_available_semaphore, render_finished_semaphore, fence, device })
+            Ok(Self { command_pool, command_buffers, secondary_command_buffers: vec![], image_available_semaphore, render_finished_semaphore, fence, device })
         }
 
         fn reset(
@@ -1077,6 +1062,183 @@ mod vulkan {
 
             Ok(())
         }
+
+        fn update(
+            &mut self,
+            recreate: &RecreateWrapper,
+            image_index: usize,
+            start: Instant,
+            object: &Model,
+            model_num: usize,
+        ) -> Result<()> {
+
+            let command_buffer = self.command_buffers[0];
+
+
+            let info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe {
+                self.device.begin_command_buffer(command_buffer, &info)?
+            };
+
+            let render_area = vk::Rect2D::builder()
+                .offset(vk::Offset2D::default())
+                .extent(recreate.swapchain.swapchain_extent);
+
+            let color_clear_value = vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            };
+
+            let depth_clear_value = vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            };
+
+            let clear_values = &[color_clear_value, depth_clear_value];
+            let info = vk::RenderPassBeginInfo::builder()
+                .render_pass(recreate.pipeline.render_pass)
+                .framebuffer(recreate.framebuffers[image_index].framebuffer)
+                .render_area(render_area)
+                .clear_values(clear_values);
+
+            unsafe {
+                self.device.cmd_begin_render_pass(
+                    command_buffer, 
+                    &info, 
+                    vk::SubpassContents::SECONDARY_COMMAND_BUFFERS
+                );
+                
+                let secondary_command_buffers = (0..model_num)
+                    .map(|i| 
+                        self.update_secondary_command_buffer(
+                            image_index, 
+                            i,
+                            recreate, 
+                            object, 
+                            start
+                        )
+                    )
+                    .collect::<Result<Vec<_>,_>>()?;
+
+                self.device.cmd_execute_commands(command_buffer, &secondary_command_buffers[..]);
+                
+                self.device.cmd_end_render_pass(command_buffer);
+                self.device.end_command_buffer(command_buffer)?;
+            }
+
+
+            Ok(())
+        }
+        
+        fn update_secondary_command_buffer(
+            &mut self,
+            image_index: usize,
+            model_index: usize,
+            // framebuffer: &FramebufferWrapper,
+            // render_pass: vk::RenderPass,
+            recreate: &RecreateWrapper,
+            object: &Model,
+            start: Instant,
+        ) -> Result<vk::CommandBuffer> {
+            // self.secondary_command_buffers.resize_with(image_index + 1, );
+            let command_buffers = &mut self.secondary_command_buffers;
+            while model_index >= command_buffers.len() {
+                let allocate_info = vk::CommandBufferAllocateInfo::builder()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::SECONDARY)
+                    .command_buffer_count(1);
+
+                let command_buffer = unsafe {
+                    self.device.allocate_command_buffers(&allocate_info)?
+                };
+                command_buffers.extend(command_buffer);
+            }
+
+            let command_buffer = command_buffers[model_index];
+
+            // Model specific data
+
+            let time = start.elapsed().as_secs_f32();
+
+            let y = (((model_index % 2) as f32) * 2.5) - 1.25;
+            let z = (((model_index / 2) as f32) * -2.0) + 1.0;
+
+            let model = Mat4::from_translation(vec3(0.0, y, z)) *  Mat4::from_axis_angle(
+                vec3(0.0, 0.0, 1.0), 
+                Deg(90.0) * time,
+            );
+
+            let model_bytes = unsafe {
+                &*std::slice::from_raw_parts(
+                    &model as *const Mat4 as *const u8,
+                    size_of::<Mat4>(),
+                )
+            };
+
+            let opacity = (model_index + 1) as f32 * 0.25;
+            let opacity_bytes = &opacity.to_ne_bytes()[..];
+
+
+
+            let inheritance_info = vk::CommandBufferInheritanceInfo::builder()
+                .render_pass(recreate.pipeline.render_pass)
+                .subpass(0)
+                .framebuffer(recreate.framebuffers[image_index].framebuffer);
+
+            let info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::RENDER_PASS_CONTINUE)
+                .inheritance_info(&inheritance_info);
+
+            unsafe {
+                self.device.begin_command_buffer(command_buffer, &info)?;
+
+                self.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, recreate.pipeline.pipeline);
+                self.device.cmd_bind_vertex_buffers(command_buffer, 0, &[object.vertex_buffer.buffer.buffer], &[0]);
+                self.device.cmd_bind_index_buffer(command_buffer, object.index_buffer.buffer.buffer, 0, vk::IndexType::UINT32);
+                self.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS, 
+                    recreate.pipeline.pipeline_layout, 
+                    0, 
+                    &[recreate.descriptor_sets.descriptor_sets[image_index]], 
+                    &[],
+                );
+                self.device.cmd_push_constants(
+                    command_buffer, 
+                    recreate.pipeline.pipeline_layout, 
+                    vk::ShaderStageFlags::VERTEX, 
+                    0, 
+                    model_bytes,
+                );
+                self.device.cmd_push_constants(
+                    command_buffer, 
+                    recreate.pipeline.pipeline_layout, 
+                    vk::ShaderStageFlags::FRAGMENT, 
+                    64, 
+                    opacity_bytes,
+                );
+
+                self.device.cmd_draw_indexed(
+                    command_buffer, 
+                    object.indices.len() as u32, 
+                    1, 
+                    0, 
+                    0, 
+                    0,
+                );
+
+
+                self.device.end_command_buffer(command_buffer)?;
+            }
+
+            Ok(command_buffer)
+
+        }
+        
     }
 
 
@@ -1658,92 +1820,7 @@ mod vulkan {
 
             
 
-            let command_buffer = frame.command_buffers[0];
-
-            /*
-            unsafe {
-                self.device.reset_command_buffer(
-                    command_buffer, 
-                    vk::CommandBufferResetFlags::empty()
-                )?;
-            }
-            */
-
-            let time = start.elapsed().as_secs_f32();
-
-            let push_model = Mat4::from_axis_angle(
-                vec3(0.0, 0.0, 1.0), 
-                Deg(90.0) * time,
-            );
-
-            let model_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &push_model as *const Mat4 as *const u8, 
-                    size_of::<Mat4>(),
-                )
-            };
-
-            let info = vk::CommandBufferBeginInfo::builder()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            unsafe {
-                self.device.begin_command_buffer(command_buffer, &info)?
-            };
-
-            let render_area = vk::Rect2D::builder()
-                .offset(vk::Offset2D::default())
-                .extent(swapchain.swapchain_extent);
-
-            let color_clear_value = vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0],
-                },
-            };
-
-            let depth_clear_value = vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
-                    stencil: 0,
-                },
-            };
-
-            let clear_values = &[color_clear_value, depth_clear_value];
-            let info = vk::RenderPassBeginInfo::builder()
-                .render_pass(pipeline.render_pass)
-                .framebuffer(self.framebuffer)
-                .render_area(render_area)
-                .clear_values(clear_values);
-
-            unsafe {
-                self.device.cmd_begin_render_pass(command_buffer, &info, vk::SubpassContents::INLINE);
-                self.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
-                self.device.cmd_bind_vertex_buffers(command_buffer, 0, &[model.vertex_buffer.buffer.buffer], &[0]);
-                self.device.cmd_bind_index_buffer(command_buffer, model.index_buffer.buffer.buffer, 0, vk::IndexType::UINT32);
-                self.device.cmd_bind_descriptor_sets(
-                    command_buffer, 
-                    vk::PipelineBindPoint::GRAPHICS, 
-                    pipeline.pipeline_layout, 
-                    0, 
-                    &[descriptor_sets.descriptor_sets[image_index]], 
-                    &[]
-                );
-                self.device.cmd_push_constants(
-                    command_buffer, 
-                    pipeline.pipeline_layout, 
-                    vk::ShaderStageFlags::VERTEX, 
-                    0,
-                    model_bytes,
-                );
-                self.device.cmd_push_constants(
-                    command_buffer, 
-                    pipeline.pipeline_layout, 
-                    vk::ShaderStageFlags::FRAGMENT, 
-                    64, 
-                    &0.25f32.to_ne_bytes()[..],
-                );
-                self.device.cmd_draw_indexed(command_buffer, model.indices.len() as u32, 1, 0, 0, 0);
-                self.device.cmd_end_render_pass(command_buffer);
-                self.device.end_command_buffer(command_buffer)?;
-            }
+            
             
             Ok(())
         }

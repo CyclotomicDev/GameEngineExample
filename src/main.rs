@@ -5,10 +5,11 @@ use data::DataHandler;
 use control::ControlHandler;
 use layers::AnyLayer;
 use winit::{
-    event::{Event, WindowEvent},
+    event::{Event, WindowEvent, ElementState, },
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
     platform::pump_events::{PumpStatus, EventLoopExtPumpEvents},
+    keyboard::{KeyCode, PhysicalKey},
 };
 use std::time::Duration;
 use tokio::{join, sync::Mutex};
@@ -74,6 +75,20 @@ async fn main() -> Result<()> {
                 } => {
                     // // Non-continuous requests 
                 },
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::KeyboardInput { event, .. } => {
+                        if event.state == ElementState::Pressed {
+                            match  event.physical_key {
+                                PhysicalKey::Code(KeyCode::ArrowLeft) => graphics.dec(),
+                                PhysicalKey::Code(KeyCode::ArrowRight) => graphics.inc(),
+                                _ => {},
+                            } {
+                                
+                            }
+                        }
+                    }
+                    _ => {},
+                }
                 _ => (),
             }
         });
