@@ -12,6 +12,7 @@ graphics = {path = "lib/graphics"}
 data = {path = "lib/data"}
 layers = {path = "lib/layers"}
 state = {path = "lib/state"}
+map = {path = "lib/map"}
 winit = "0.29.11"
 tokio = { version = "1.36.0", features = ["full"]}
 anyhow = "1.0.80"
