@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 [00:00:00.220] (65ac) INFO   Country { name: "Costa Rica", geometry: Polygon(Polygon { exterior: LineString([Coord { x: -82.54619625520348, y: 9.566134751824675 }, Coord { x: -82.93289099804358, y: 9.476812038608172 }, Coord { x: -82.92715491405916, y: 9.074330145702916 }, Coord { x: -82.71918311230053, y: 8.925708726431495 }, Coord { x: -82.86865719270477, y: 8.807266343618522 }, Coord { x: -82.82977067740516, y: 8.62629547773237 }, Coord { x: -82.91317643912421, y: 8.42351715741907 }, Coord { x: -82.96578304719736, y: 8.225027980985985 }, Coord { x: -83.50843726269431, y: 8.446926581247283 }, Coord { x: -83.71147396516908, y: 8.656836249216866 }, Coord { x: -83.59631303580665, y: 8.830443223501419 }, Coord { x: -83.63264156770784, y: 9.05138580976532 }, Coord { x: -83.90988562695374, y: 9.29080272057358 }, Coord { x: -84.30340165885636, y: 9.487354030795714 }, Coord { x: -84.64764421256866, y: 9.61553742109571 }, Coord { x: -84.71335079622777, y: 9.908051866083852 }, Coord { x: -84.97566036654133, y: 10.086723130733006 }, Coord { x: -84.91137488477024, y: 9.795991522658923 }, Coord { x: -85.11092342806532, y: 9.55703969974131 }, Coord { x: -85.33948828809227, y: 9.83454214114866 }, Coord { x: -85.66078650586698, y: 9.933347479690724 }, Coord { x: -85.79744483106285, y: 10.134885565629034 }, Coord { x: -85.79170874707843, y: 10.439337266476612 }, Coord { x: -85.65931372754667, y: 10.75433095951172 }, Coord { x: -85.94172543002176, y: 10.8952784285878 }, Coord { x: -85.7125404528073, y: 11.088444932494824 }, Coord { x: -85.5618519762442, y: 11.217119248901597 }, Coord { x: -84.90300330273895, y: 10.952303371621896 }, Coord { x: -84.67306901725627, y: 11.082657172078145 }, Coord { x: -84.35593075228104, y: 10.999225572142905 }, Coord { x: -84.19017859570485, y: 10.793450018756674 }, Coord { x: -83.89505449088595, y: 10.726839097532446 }, Coord { x: -83.65561174186158, y: 10.938764146361422 }, Coord { x: -83.40231970898296, y: 10.395438137244652 }, Coord { x: -83.01567664257517, y: 9.992982082555557 }, Coord { x: -82.54619625520348, y: 9.566134751824675 }]), interiors: [] }), color: Color(0, 0, 0) }
 [00:00:01.027] (65ac) INFO   Window successfully created
 [00:00:10.014] (65ac) WARN   Skipping physical device (`Intel(R) Iris(R) Xe Graphics`): Missing Only discrete GPUs are supported
@@ -7,3 +8,13 @@
 [00:00:16.388] (65ac) INFO   Window close requested
 [00:00:16.392] (65ac) INFO   Main loop exited
 [00:00:17.089] (65ac) INFO   Before instance destroyed
+=======
+[00:00:00.453] (918) INFO   Window successfully created
+[00:00:16.217] (918) WARN   Skipping physical device (`Intel(R) Iris(R) Xe Graphics`): Missing Only discrete GPUs are supported
+[00:00:16.246] (918) INFO   Selected physical device (`NVIDIA GeForce RTX 3070 Ti Laptop GPU`)
+[00:00:17.239] (918) INFO   Swapchain recreated
+[00:00:18.104] (918) INFO   Swapchain recreated
+[00:00:37.607] (918) INFO   Window close requested
+[00:00:37.611] (918) INFO   Main loop exited
+[00:00:38.326] (918) INFO   Before instance destroyed
+>>>>>>> 9d8783cf154964ac0f227b8e361fa46498810b44
